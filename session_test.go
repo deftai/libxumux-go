@@ -663,3 +663,44 @@ func TestCloseOverTCPIsPrompt(t *testing.T) {
 	assert.Less(t, time.Since(start), time.Second)
 	assert.Equal(t, CloseError{Code: CodeNormal, Remote: true}, server.CloseInfo())
 }
+
+func TestConnectionLostIsReportedAsLost(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+	opts := Options{PingInterval: -1}
+	raw := make(chan net.Conn, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		raw <- c
+		_, _, _ = Accept(context.Background(), NewStreamConn(c), ServerConfig{Authorize: nil}, acceptAll(func(*Channel) {}))
+	}()
+	c, err := net.Dial("tcp", l.Addr().String())
+	require.NoError(t, err)
+	client, res, err := Connect(context.Background(), NewStreamConn(c), ClientConfig{
+		Channels: []ChannelSpec{{Name: "d", Reliable: true, Ordered: true}},
+	}, opts)
+	require.NoError(t, err)
+	// The server process "dies": its socket closes with no CLOSE exchange.
+	(<-raw).Close()
+	<-client.Done()
+	info := client.CloseInfo()
+	assert.True(t, info.Lost)
+	assert.Equal(t, CodeGoingAway, info.Code)
+	assert.Contains(t, info.Error(), "xumux: connection lost: ")
+	assert.NotContains(t, info.Error(), "closed by remote")
+	_, err = res.Channels[0].Receive(ctx(t))
+	var ce *CloseError
+	require.ErrorAs(t, err, &ce)
+	assert.True(t, ce.Lost, "channels see the loss too")
+
+	// A clean CLOSE is not a loss.
+	a, b, _ := pair(t, opts, opts)
+	require.NoError(t, a.Close(ctx(t), CodeNormal, ""))
+	<-b.Done()
+	assert.False(t, b.CloseInfo().Lost)
+	assert.False(t, a.CloseInfo().Lost)
+}

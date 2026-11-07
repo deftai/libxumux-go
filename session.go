@@ -712,11 +712,11 @@ func (s *Session) readFailed(err error) {
 		// reply, or our own) may still be queued: let it reach the wire.
 		s.finishAfterCloseWrittenLocked()
 	default:
-		reason := "transport closed"
+		reason := "peer closed the transport without a CLOSE"
 		if !errors.Is(err, io.EOF) {
 			reason = err.Error()
 		}
-		s.finishLocked(CloseError{Code: CodeGoingAway, Reason: reason, Remote: true})
+		s.finishLocked(CloseError{Code: CodeGoingAway, Reason: reason, Remote: true, Lost: true})
 	}
 }
 
@@ -1325,7 +1325,7 @@ func (s *Session) writeLoop() {
 			s.mu.Lock()
 			info := s.closeInfo
 			if s.state == stateOpen {
-				info = CloseError{Code: CodeGoingAway, Reason: "transport write failed: " + err.Error()}
+				info = CloseError{Code: CodeGoingAway, Reason: "transport write failed: " + err.Error(), Lost: true}
 			}
 			s.finishLocked(info)
 			s.mu.Unlock()

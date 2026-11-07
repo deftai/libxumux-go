@@ -172,9 +172,15 @@ type CloseError struct {
 	Reason string
 	// Remote is true when the peer initiated the close.
 	Remote bool
+	// Lost is true when the connection ended without a CLOSE exchange: the
+	// transport failed or the peer went away (Code is then 1001).
+	Lost bool
 }
 
 func (e *CloseError) Error() string {
+	if e.Lost {
+		return "xumux: connection lost: " + e.Reason
+	}
 	who := "local"
 	if e.Remote {
 		who = "remote"
