@@ -1074,11 +1074,13 @@ func (s *Session) onCloseChannelLocked(c *Channel, m closeChannelMsg) {
 	}
 	if !c.sentClose {
 		s.sendCloseChannelLocked(c, CodeNormal, "")
-		return
 	}
-	if c.closeWritten {
-		s.finishChannelLocked(c)
-	}
+	// Both CLOSE_CHANNELs are now sent (ours at least queued, in order) and
+	// received, so the close is complete (core §5.4). Don't wait for our
+	// frame's write callback: the peer may reuse the ID at once, and its
+	// OPEN_CHANNEL can arrive before that callback runs. Anything we later
+	// send on a reused ID is queued behind our CLOSE_CHANNEL.
+	s.finishChannelLocked(c)
 }
 
 func (s *Session) sendCloseChannelLocked(c *Channel, code int, reason string) {
@@ -1097,14 +1099,9 @@ func (s *Session) sendCloseChannelLocked(c *Channel, code int, reason string) {
 	if code != CodeNormal || reason != "" {
 		m.Code, m.Reason = code, reason
 	}
-	_, err := s.enqueueLocked(controlFrame(TypeCloseChannel, m), func(error) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		c.closeWritten = true
-		if c.recvClose {
-			s.finishChannelLocked(c)
-		}
-	}, false)
+	// The close completes when the peer's CLOSE_CHANNEL arrives
+	// (onCloseChannelLocked), not when ours is written.
+	_, err := s.enqueueLocked(controlFrame(TypeCloseChannel, m), nil, false)
 	if err != nil {
 		s.finishChannelLocked(c)
 	}

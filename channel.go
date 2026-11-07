@@ -46,7 +46,7 @@ type Channel struct {
 	// Guarded by s.mu.
 	state                              chanState
 	props                              Properties
-	sentClose, recvClose, closeWritten bool
+	sentClose, recvClose               bool
 	abandon                            bool
 	closeInfo                          *CloseError
 	openErr                            error
