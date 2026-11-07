@@ -61,6 +61,10 @@ type Channel struct {
 	heldPings                          int
 	pings                              map[uint32]*pendingPing
 	stats                              statsRecorder
+	// Receive-window auto-tuning (see Options.MaxChannelWindow).
+	recvWindow int64     // current window: credit the peer may hold
+	tuneStart  time.Time // start of the current measurement
+	tuneBytes  int64     // bytes returned since tuneStart
 }
 
 func (spec ChannelSpec) request(id uint16) ChannelRequest {
@@ -76,8 +80,11 @@ func (s *Session) newChannel(r ChannelRequest, localOpener bool, state chanState
 		opened: make(chan struct{}), done: make(chan struct{}), sendSem: make(chan struct{}, 1),
 		state: state, props: Properties{Reliable: r.Reliable, Ordered: r.Ordered, MaxRetransmits: r.MaxRetransmits, MaxPacketLifeTime: r.MaxPacketLifeTime},
 		recvCredit: int64(s.local.InitialWindow), creditSig: make(chan struct{}), inboxSig: make(chan struct{}),
-		pings: map[uint32]*pendingPing{},
+		pings: map[uint32]*pendingPing{}, recvWindow: int64(s.local.InitialWindow),
+		// The first measurement starts when the initial window is granted.
+		tuneStart: time.Now(),
 	}
+	s.windowTotal += c.recvWindow
 	s.chans[r.ID] = c
 	return c
 }
@@ -106,6 +113,15 @@ func (c *Channel) Stats() Stats {
 	c.s.mu.Lock()
 	defer c.s.mu.Unlock()
 	return c.stats.Stats
+}
+
+// ReceiveWindow is the channel's current receive window: the most this side
+// lets the peer send ahead of what it has consumed. It starts at the
+// initial window and grows with auto-tuning.
+func (c *Channel) ReceiveWindow() int64 {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	return c.recvWindow
 }
 
 // Done is closed once the channel is fully closed.

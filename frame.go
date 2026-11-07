@@ -76,6 +76,11 @@ const (
 	DefaultInitialWindow   = 262144
 	MinMaxFramePayload     = 4096
 	MaxWindow              = 1<<31 - 1
+	// DefaultMaxChannelWindow and DefaultConnectionWindow bound receive-window
+	// auto-tuning: how far one channel's window may grow, and the sum of all
+	// channel windows on a connection.
+	DefaultMaxChannelWindow = 16 << 20
+	DefaultConnectionWindow = 64 << 20
 )
 
 // Frame is one xumux frame.
