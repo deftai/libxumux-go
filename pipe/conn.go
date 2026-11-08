@@ -95,52 +95,96 @@ func (c *Conn) Read(b []byte) (int, error) {
 		return 0, c.opErr("read", err)
 	}
 	for len(c.rbuf) == 0 {
-		if c.isClosed() {
-			return 0, c.opErr("read", net.ErrClosed)
-		}
-		if c.rerr != nil {
-			return 0, c.rerr
-		}
-		if len(b) == 0 {
+		if len(b) == 0 && c.rerr == nil {
 			return 0, nil
 		}
-		m, err := c.ch.Receive(c.rdl.ctx())
-		if err != nil {
-			if c.isClosed() {
-				return 0, c.opErr("read", net.ErrClosed)
-			}
-			if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-				return 0, c.opErr("read", err) // not sticky: a new deadline can retry
-			}
-			c.rerr = err // io.EOF after a normal close, else a *xumux.CloseError
-			continue
-		}
-		switch m.Type {
-		case TypeData:
-			c.rbuf = m.Payload
-		case TypeEOF:
-			c.rerr = io.EOF
-			c.mu.Lock()
-			c.gotEOF = true
-			done := c.sentEOF
-			c.mu.Unlock()
-			if done {
-				c.closeChannel(xumux.CodeNormal, "")
-			}
-		case TypeReset:
-			var r resetMsg
-			_ = json.Unmarshal(m.Payload, &r)
-			c.rerr = &ResetError{Code: r.Code, Reason: r.Reason}
-			c.fail(c.rerr, xumux.CodeGoingAway, "")
-		default:
-			c.rerr = fmt.Errorf("pipe: unknown pipe/1 message type %#x", m.Type)
-			c.fail(c.rerr, xumux.CodeProtocolError, c.rerr.Error())
+		if err := c.fillLocked(); err != nil {
+			return 0, err
 		}
 	}
 	n := copy(b, c.rbuf)
 	c.rbuf = c.rbuf[n:]
 	c.ch.ReturnCredit(n)
 	return n, nil
+}
+
+// WriteTo implements io.WriterTo, which io.Copy uses when copying from a
+// Conn. It writes the peer's bytes to w as they arrive, without an extra
+// buffer, and returns credit only once w has taken them, so a slow w
+// slows the peer exactly (pipe/1 requires credit to follow writes to the
+// local end; Read can only return it as bytes reach the caller's buffer).
+// It returns nil at EOF, as io.Copy expects, and honours the read
+// deadline.
+func (c *Conn) WriteTo(w io.Writer) (int64, error) {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	var total int64
+	for {
+		if len(c.rbuf) == 0 {
+			if err := c.fillLocked(); err != nil {
+				if err == io.EOF {
+					return total, nil
+				}
+				return total, err
+			}
+			continue
+		}
+		n, err := w.Write(c.rbuf)
+		total += int64(n)
+		c.rbuf = c.rbuf[n:]
+		c.ch.ReturnCredit(n)
+		if err != nil {
+			return total, err
+		}
+	}
+}
+
+// fillLocked receives the next message, with rmu held. It fills rbuf for
+// DATA (possibly with nothing, for an empty DATA), or returns the error
+// that ends reading: io.EOF, a *ResetError, a closed channel, a timeout.
+func (c *Conn) fillLocked() error {
+	if c.isClosed() {
+		return c.opErr("read", net.ErrClosed)
+	}
+	if c.rerr != nil {
+		return c.rerr
+	}
+	m, err := c.ch.Receive(c.rdl.ctx())
+	if err != nil {
+		if c.isClosed() {
+			return c.opErr("read", net.ErrClosed)
+		}
+		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+			return c.opErr("read", err) // not sticky: a new deadline can retry
+		}
+		c.rerr = err // io.EOF after a normal close, else a *xumux.CloseError
+		return err
+	}
+	switch m.Type {
+	case TypeData:
+		c.rbuf = m.Payload
+	case TypeEOF:
+		c.rerr = io.EOF
+		c.mu.Lock()
+		c.gotEOF = true
+		done := c.sentEOF
+		c.mu.Unlock()
+		if done {
+			c.closeChannel(xumux.CodeNormal, "")
+		}
+		return io.EOF
+	case TypeReset:
+		var r resetMsg
+		_ = json.Unmarshal(m.Payload, &r)
+		c.rerr = &ResetError{Code: r.Code, Reason: r.Reason}
+		c.fail(c.rerr, xumux.CodeGoingAway, "")
+		return c.rerr
+	default:
+		c.rerr = fmt.Errorf("pipe: unknown pipe/1 message type %#x", m.Type)
+		c.fail(c.rerr, xumux.CodeProtocolError, c.rerr.Error())
+		return c.rerr
+	}
+	return nil
 }
 
 // Write implements io.Writer. It returns once every byte is handed to the
