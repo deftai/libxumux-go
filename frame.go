@@ -81,6 +81,9 @@ const (
 	// channel windows on a connection.
 	DefaultMaxChannelWindow = 16 << 20
 	DefaultConnectionWindow = 64 << 20
+	// DefaultMaxControlQueue bounds the control and probe frames queued for
+	// sending (see Options.MaxControlQueue).
+	DefaultMaxControlQueue = 1 << 20
 )
 
 // Frame is one xumux frame.

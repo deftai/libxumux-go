@@ -66,6 +66,12 @@ type Options struct {
 	// not shrink; a channel's window leaves the sum when it closes, though
 	// data it received that the application has not read yet stays buffered.
 	ConnectionWindow int64
+	// MaxControlQueue caps the bytes of control and probe frames (CHANNEL_ACK,
+	// WINDOW_UPDATE, PONG, ERROR, ...) queued for sending, default 1 MiB. They
+	// pile up only if the peer stops reading while it keeps sending frames
+	// that need a reply; past the cap the connection closes with 4004. Data
+	// frames are bounded by flow control instead. Negative: no cap.
+	MaxControlQueue int64
 	// Acceptor decides on peer-opened channels. Nil refuses them with 1003.
 	Acceptor Acceptor
 	// OnError is called (in its own goroutine) for each ERROR the peer sends.
@@ -110,6 +116,9 @@ func (o Options) withDefaults() Options {
 	if o.ConnectionWindow <= 0 {
 		o.ConnectionWindow = DefaultConnectionWindow
 	}
+	if o.MaxControlQueue == 0 {
+		o.MaxControlQueue = DefaultMaxControlQueue
+	}
 	return o
 }
 
@@ -126,6 +135,7 @@ type outItem struct {
 	done    chan error // buffered; may be nil
 	after   func(err error)
 	isClose bool
+	cost    int64 // bytes counted against MaxControlQueue
 }
 
 func (it *outItem) finish(err error) {
@@ -174,6 +184,7 @@ type Session struct {
 
 	// Outbound scheduler, guarded by mu.
 	urgent       []*outItem
+	urgentBytes  int64 // bytes queued in urgent, for MaxControlQueue
 	data         map[uint16][]*outItem
 	rr           []uint16
 	windowDirty  bool
@@ -445,6 +456,11 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 	}
 	var open []acceptedChannel
 	for _, r := range h.Channels {
+		if len(open) >= s.opts.MaxChannels {
+			// No reason: a long list of refusals must still fit in WELCOME.
+			welcome.Rejected = append(welcome.Rejected, ChannelRefusal{ID: r.ID, Code: CodeChannelLimit})
+			continue
+		}
 		handler, refusal := s.decide(r)
 		if refusal != nil {
 			welcome.Rejected = append(welcome.Rejected, *refusal)
@@ -1233,7 +1249,7 @@ func (s *Session) finishLocked(info CloseError) {
 	for _, it := range s.urgent {
 		it.finish(ErrClosed)
 	}
-	s.urgent = nil
+	s.urgent, s.urgentBytes = nil, 0
 	for id := range s.data {
 		s.dropQueuedLocked(id, ErrClosed)
 	}
@@ -1271,6 +1287,15 @@ func (s *Session) enqueueLocked(f Frame, after func(error), dataChannel bool) (*
 		}
 		s.data[f.Channel] = append(q, it)
 	} else {
+		it.cost = int64(HeaderSize + len(f.Payload))
+		if limit := s.opts.MaxControlQueue; limit > 0 && s.urgentBytes+it.cost > limit {
+			// The peer keeps sending frames that need a reply but doesn't read
+			// the replies. Close rather than queue without bound. (Pausing
+			// reads instead could deadlock two such peers.)
+			s.beginCloseLocked(CodeRateLimited, fmt.Sprintf("peer is not reading: over %d bytes of control frames queued", limit), false)
+			return nil, ErrClosed
+		}
+		s.urgentBytes += it.cost
 		s.urgent = append(s.urgent, it)
 	}
 	s.signalWriter()
@@ -1306,6 +1331,7 @@ func (s *Session) nextLocked() *outItem {
 	if len(s.urgent) > 0 {
 		it := s.urgent[0]
 		s.urgent = s.urgent[1:]
+		s.urgentBytes -= it.cost
 		return it
 	}
 	if s.windowDirty && s.state == stateOpen {
