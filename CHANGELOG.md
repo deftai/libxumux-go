@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
 Implements xumux core 0.3 (spec tag `v0.3.0-draft`). 0.x minors are incompatible, so this release cannot connect to a 0.2 peer, including libxumux (TypeScript) up to v0.4.0 and libxumux-go up to v0.3.0.
 
 ### Changed
@@ -71,7 +73,8 @@ Also the first releases of the nested modules `ws` (`ws/v0.1.0`) and `webrtc` (`
 - First standalone release. The package was developed inside [xumcat](https://github.com/deftai/xumcat), where it last shipped in xumcat v0.3.1, and moved here with its history. The API is unchanged apart from the import path, now `github.com/deftai/libxumux-go` (package `xumux`).
 - A runnable package example: an echo server and client over TCP.
 
-[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/deftai/libxumux-go/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/deftai/libxumux-go/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/deftai/libxumux-go/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/deftai/libxumux-go/compare/v0.2.0...v0.2.1
