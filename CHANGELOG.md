@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+Implements xumux core 0.3 (spec tag `v0.3.0-draft`). 0.x minors are incompatible, so this release cannot connect to a 0.2 peer, including libxumux (TypeScript) up to v0.4.0 and libxumux-go up to v0.3.0.
+
+### Changed
+
+- **Breaking (protocol):** `Version` is `[0, 3, 0]`. A server refuses a 0.2 HELLO with CLOSE 4006, and a client closes a 0.2 WELCOME with 1002 (core §3.5).
+- `testdata/vectors.json` is the 0.3 spec's `conformance/vectors.json`, adding `hello-extension-params`, `extension-params-not-object` and `hello-version-0-2`.
+- CI runs the behavioural conformance suite from the spec at `v0.3.0-draft` (57 scenarios).
+- `Connect` fails without sending anything if HELLO would exceed the 65536-byte channel-0 limit or its `ExtensionParams` are not valid JSON; `Accept` refuses with CLOSE 1001 if WELCOME would.
+
+### Added
+
+- `extensionParams` (core §3.8): `Hello.ExtensionParams` and `Welcome.ExtensionParams` (`map[string]json.RawMessage`); `ClientConfig.ExtensionParams` and `ClientConfig.CheckExtensionParams func(name string, params json.RawMessage) error` (an error closes with 4001); `ServerConfig.NegotiateExtension func(ctx context.Context, name string, params json.RawMessage) (json.RawMessage, error)` (an error leaves the extension out of WELCOME); `Session.Extensions() []string` and `Session.ExtensionParams(name string) (local, peer json.RawMessage)`. Parameters for extensions that are not accepted are ignored and never sent, and a client sends parameters only for extensions it requests. `extensionParams` that is not a JSON object closes with 4001.
+- Extension-defined first frames (core §3.1): `ServerConfig.FirstFrames map[byte]FirstFrameHandler`, with `type FirstFrameHandler func(ctx context.Context, conn FrameConn, f Frame) error`, lets an extension take a transport whose first frame is one of its control types (0x30–0x7F, `MinExtensionControlType`–`MaxExtensionControlType`); `Accept` then returns `ErrFirstFrameHandled`. With no handler, a first frame other than HELLO still closes with 1002.
+
 ## [0.3.0] - 2026-11-08
 
 ### Added

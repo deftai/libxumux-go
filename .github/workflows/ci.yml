@@ -77,8 +77,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: deftai/xumux
-          # Pinned to the last 0.2 spec until this library implements 0.3.
-          ref: 41c7b797f7a98b87de1098fde6f27257c3d8b6fd
+          # The 0.3 draft this library implements.
+          ref: v0.3.0-draft
           path: xumux-spec
       - uses: actions/setup-go@v5
         with:

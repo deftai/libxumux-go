@@ -182,7 +182,7 @@ func jsonOf(t *testing.T, f Frame) map[string]any {
 
 // helloAndWelcome acts as a client: send HELLO, return WELCOME.
 func (r *rawPeer) helloAndWelcome(extra map[string]any) Frame {
-	h := map[string]any{"version": []int{0, 2, 0}}
+	h := map[string]any{"version": Version}
 	for k, v := range extra {
 		h[k] = v
 	}
@@ -199,7 +199,7 @@ func (r *rawPeer) awaitHelloSendWelcome(extra map[string]any) map[string]any {
 			chans = append(chans, map[string]any{"id": c.(map[string]any)["id"], "reliable": true, "ordered": true})
 		}
 	}
-	w := map[string]any{"version": []int{0, 2, 0}, "channels": chans}
+	w := map[string]any{"version": Version, "channels": chans}
 	for k, v := range extra {
 		w[k] = v
 	}

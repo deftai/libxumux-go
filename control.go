@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"unicode/utf8"
 )
 
@@ -48,25 +49,31 @@ type Limits struct {
 
 // Hello is the client's HELLO.
 type Hello struct {
-	Version      [3]int           `json:"version"`
-	Application  string           `json:"application,omitempty"`
-	Extensions   []string         `json:"extensions,omitempty"`
-	Limits                        // flattened
-	PingInterval float64          `json:"pingInterval"`
-	PingTimeout  float64          `json:"pingTimeout"`
-	Channels     []ChannelRequest `json:"channels,omitempty"`
-	Auth         map[string]any   `json:"auth,omitempty"`
+	Version     [3]int   `json:"version"`
+	Application string   `json:"application,omitempty"`
+	Extensions  []string `json:"extensions,omitempty"`
+	// ExtensionParams holds parameters for requested extensions, keyed by
+	// extension name (core §3.8). Each value is defined by its extension.
+	ExtensionParams map[string]json.RawMessage `json:"extensionParams,omitempty"`
+	Limits                                     // flattened
+	PingInterval    float64                    `json:"pingInterval"`
+	PingTimeout     float64                    `json:"pingTimeout"`
+	Channels        []ChannelRequest           `json:"channels,omitempty"`
+	Auth            map[string]any             `json:"auth,omitempty"`
 }
 
 // Welcome is the server's WELCOME.
 type Welcome struct {
-	Version      [3]int           `json:"version"`
-	Extensions   []string         `json:"extensions,omitempty"`
-	Limits                        // flattened
-	PingInterval float64          `json:"pingInterval"`
-	PingTimeout  float64          `json:"pingTimeout"`
-	Channels     []ChannelAccept  `json:"channels,omitempty"`
-	Rejected     []ChannelRefusal `json:"rejected,omitempty"`
+	Version    [3]int   `json:"version"`
+	Extensions []string `json:"extensions,omitempty"`
+	// ExtensionParams holds parameters for accepted extensions, keyed by
+	// extension name (core §3.8).
+	ExtensionParams map[string]json.RawMessage `json:"extensionParams,omitempty"`
+	Limits                                     // flattened
+	PingInterval    float64                    `json:"pingInterval"`
+	PingTimeout     float64                    `json:"pingTimeout"`
+	Channels        []ChannelAccept            `json:"channels,omitempty"`
+	Rejected        []ChannelRefusal           `json:"rejected,omitempty"`
 }
 
 type closeChannelMsg struct {
@@ -90,6 +97,20 @@ type ErrorMessage struct {
 type windowEntry struct {
 	Channel   uint16
 	Increment uint32
+}
+
+// encodeControl encodes a control message whose content comes partly from
+// the application (HELLO, WELCOME): it fails, rather than panics, on JSON
+// that does not marshal, and on a payload above the channel-0 limit (core §4).
+func encodeControl(typ byte, v any) (Frame, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return Frame{}, fmt.Errorf("xumux: encoding control message %#x: %w", typ, err)
+	}
+	if len(b) > ControlMaxPayload {
+		return Frame{}, fmt.Errorf("xumux: control message %#x is %d bytes, above the %d-byte limit", typ, len(b), ControlMaxPayload)
+	}
+	return Frame{Channel: ControlChannel, Type: typ, Payload: b}, nil
 }
 
 func controlFrame(typ byte, v any) Frame {
@@ -276,7 +297,8 @@ func decodeHello(p []byte) (Hello, error) {
 	if h.PingTimeout, err = decodeSeconds(m, "pingTimeout", 10); err != nil {
 		return h, err
 	}
-	if err = fields(m, opt("application", &h.Application), opt("extensions", &h.Extensions), opt("auth", &h.Auth)); err != nil {
+	if err = fields(m, opt("application", &h.Application), opt("extensions", &h.Extensions), opt("auth", &h.Auth),
+		opt("extensionParams", &h.ExtensionParams)); err != nil {
 		return h, err
 	}
 	h.Channels, err = decodeList(m, "channels", decodeChannelRequest)
@@ -301,7 +323,7 @@ func decodeWelcome(p []byte) (Welcome, error) {
 	if w.PingTimeout, err = decodeSeconds(m, "pingTimeout", 10); err != nil {
 		return w, err
 	}
-	if err = field(m, "extensions", &w.Extensions, false); err != nil {
+	if err = fields(m, opt("extensions", &w.Extensions), opt("extensionParams", &w.ExtensionParams)); err != nil {
 		return w, err
 	}
 	if w.Channels, err = decodeList(m, "channels", decodeChannelAccept); err != nil {
