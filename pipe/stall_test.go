@@ -109,3 +109,87 @@ func TestResetGoesWholeWithLittleCredit(t *testing.T) {
 	assert.Equal(t, reason, re.Reason)
 	assert.NoError(t, <-reset)
 }
+
+// stalledPair returns a pipe whose dialing side's transport can be held.
+func stalledPair(t *testing.T) (c, srv *pipe.Conn, fc *stallable) {
+	t.Helper()
+	l := pipe.NewListener()
+	t.Cleanup(func() { l.Close() })
+	a, b := net.Pipe()
+	sopts := opts
+	sopts.Acceptor = l.Acceptor()
+	go func() {
+		_, _, _ = xumux.Accept(context.Background(), xumux.NewStreamConn(b), xumux.ServerConfig{}, sopts)
+	}()
+	fc = &stallable{FrameConn: xumux.NewStreamConn(a)}
+	client, _, err := xumux.Connect(context.Background(), fc, xumux.ClientConfig{}, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close(context.Background(), xumux.CodeNormal, "") })
+	c, err = pipe.Dial(ctx(t), client, "x", "")
+	require.NoError(t, err)
+	srv, err = l.AcceptPipe(ctx(t))
+	require.NoError(t, err)
+	return c, srv, fc
+}
+
+// A CloseWrite that times out on a stalled transport has still queued
+// its EOF, so no DATA may follow it.
+func TestNoWritesAfterAQueuedEOF(t *testing.T) {
+	c, srv, fc := stalledPair(t)
+	fc.stall()
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
+	err := c.CloseWrite()
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.ErrorIs(t, err, xumux.ErrQueued)
+
+	require.NoError(t, c.SetWriteDeadline(time.Now().Add(time.Second)))
+	_, err = c.Write([]byte("lost"))
+	assert.ErrorIs(t, err, pipe.ErrWriteClosed)
+
+	fc.resume()
+	got, err := io.ReadAll(srv)
+	require.NoError(t, err)
+	assert.Empty(t, got, "the peer sees EOF and nothing after it")
+}
+
+// A pipe that fails (here, an unknown message type) releases a writer
+// blocked on credit and closes its channel promptly, even with a long
+// CloseTimeout.
+func TestFailedPipeReleasesWritersAndCloses(t *testing.T) {
+	l := pipe.NewListener()
+	defer l.Close()
+	a, b := net.Pipe()
+	sopts := opts
+	sopts.CloseTimeout = 30 * time.Second
+	sopts.Acceptor = l.Acceptor()
+	go func() {
+		_, _, _ = xumux.Accept(context.Background(), xumux.NewStreamConn(b), xumux.ServerConfig{}, sopts)
+	}()
+	client, _, err := xumux.Connect(context.Background(), xumux.NewStreamConn(a), xumux.ClientConfig{}, opts)
+	require.NoError(t, err)
+	defer client.Close(context.Background(), xumux.CodeNormal, "")
+	raw, err := client.OpenChannel(ctx(t), pipe.Spec("raw", "")) // never reads: no credit for srv
+	require.NoError(t, err)
+	srv, err := l.AcceptPipe(ctx(t))
+	require.NoError(t, err)
+
+	wrote := make(chan error, 1)
+	go func() { _, err := srv.Write(make([]byte, 4<<20)); wrote <- err }()
+	time.Sleep(100 * time.Millisecond) // the writer is now waiting for credit
+	require.NoError(t, raw.Send(ctx(t), 0x09, nil))
+	_, err = srv.Read(make([]byte, 1))
+	require.ErrorContains(t, err, "unknown pipe/1 message type")
+
+	select {
+	case err := <-wrote:
+		assert.ErrorContains(t, err, "unknown pipe/1 message type")
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer still blocked after the pipe failed")
+	}
+	select {
+	case <-srv.Channel().Done():
+		assert.Equal(t, xumux.CodeProtocolError, srv.Channel().CloseInfo().Code)
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed pipe's channel did not close")
+	}
+}

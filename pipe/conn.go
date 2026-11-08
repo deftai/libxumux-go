@@ -17,21 +17,18 @@ import (
 var ErrWriteClosed = errors.New("pipe: write after CloseWrite")
 
 // closeTimeout bounds how long Close waits to send EOF and close the
-// channel, and how long a channel the Conn closes by itself may take.
+// channel.
 const closeTimeout = 10 * time.Second
 
 // maxResetReason caps the reason a RESET carries, so it always fits in a
 // message.
 const maxResetReason = 1024
 
-// closeChannel closes the channel in the background, bounded by
-// closeTimeout, when pipe/1 says the pipe is over.
+// closeChannel closes the channel in the background when pipe/1 says the
+// pipe is over. It lives as long as the session at most; Channel.Close
+// itself bounds the wait for earlier sends by Options.CloseTimeout.
 func (c *Conn) closeChannel(code int, reason string) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-		defer cancel()
-		_ = c.ch.Close(ctx, code, reason)
-	}()
+	go func() { _ = c.ch.Close(c.ch.Session().Context(), code, reason) }()
 }
 
 // Conn is a pipe/1 channel as a net.Conn. It also has CloseWrite, for
@@ -57,6 +54,7 @@ type Conn struct {
 	wdl *deadline
 
 	mu      sync.Mutex
+	werr    error // set when the pipe has failed: every Write returns it
 	sentEOF bool
 	gotEOF  bool
 	closed  bool
@@ -133,10 +131,10 @@ func (c *Conn) Read(b []byte) (int, error) {
 			var r resetMsg
 			_ = json.Unmarshal(m.Payload, &r)
 			c.rerr = &ResetError{Code: r.Code, Reason: r.Reason}
-			c.closeChannel(xumux.CodeGoingAway, "")
+			c.fail(c.rerr, xumux.CodeGoingAway, "")
 		default:
 			c.rerr = fmt.Errorf("pipe: unknown pipe/1 message type %#x", m.Type)
-			c.closeChannel(xumux.CodeProtocolError, fmt.Sprintf("unknown pipe/1 message type %#x", m.Type))
+			c.fail(c.rerr, xumux.CodeProtocolError, c.rerr.Error())
 		}
 	}
 	n := copy(b, c.rbuf)
@@ -159,6 +157,9 @@ func (c *Conn) Write(b []byte) (int, error) {
 	if sent {
 		return 0, c.opErr("write", ErrWriteClosed)
 	}
+	if werr := c.writeErr(); werr != nil {
+		return 0, werr
+	}
 	// A deadline that has passed fails the call even when credit is free.
 	if err := c.wdl.ctx().Err(); err != nil {
 		return 0, c.opErr("write", err)
@@ -168,6 +169,9 @@ func (c *Conn) Write(b []byte) (int, error) {
 		k, err := c.ch.SendPrefix(c.wdl.ctx(), TypeData, b[n:min(len(b), n+maxChunk)])
 		n += k
 		if err != nil {
+			if werr := c.writeErr(); werr != nil {
+				return n, werr
+			}
 			if c.isClosed() {
 				err = net.ErrClosed
 			}
@@ -197,9 +201,11 @@ func (c *Conn) sendEOFLocked(ctx context.Context) error {
 		return nil
 	}
 	c.mu.Unlock()
-	if _, err := c.ch.SendPrefix(ctx, TypeEOF, nil); err != nil {
+	_, err := c.ch.SendPrefix(ctx, TypeEOF, nil)
+	if err != nil && !errors.Is(err, xumux.ErrQueued) {
 		return c.opErr("close", err)
 	}
+	// Sent, or queued and certain to be sent: no DATA may follow either way.
 	c.mu.Lock()
 	c.sentEOF = true
 	done := c.gotEOF
@@ -207,7 +213,26 @@ func (c *Conn) sendEOFLocked(ctx context.Context) error {
 	if done {
 		c.closeChannel(xumux.CodeNormal, "")
 	}
-	return nil
+	return c.opErr("close", err)
+}
+
+func (c *Conn) writeErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.werr
+}
+
+// fail ends the pipe after a RESET or a protocol error: pending and future
+// Writes return err, which also frees the channel's send slot so the
+// close can go out at once.
+func (c *Conn) fail(err error, code int, reason string) {
+	c.mu.Lock()
+	if c.werr == nil {
+		c.werr = err
+	}
+	c.mu.Unlock()
+	c.wdl.expire()
+	c.closeChannel(code, reason)
 }
 
 // Reset reports a failure of this end to the peer (a RESET message), as a

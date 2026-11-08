@@ -241,9 +241,10 @@ func (c *Channel) Send(ctx context.Context, typ byte, payload []byte) error {
 // message sent: n bytes went as a whole message, or none.
 //
 // If ctx ends while the frame waits for a slow transport, SendPrefix
-// returns n with ctx's error: the frame is queued and will still be sent,
-// from a copy, so payload can be reused at once. Later sends and Close on
-// the channel wait for it, so nothing overtakes it.
+// returns n with an error that matches both ErrQueued and ctx's error: the
+// frame is queued and will still be sent, from a copy, so payload can be
+// reused at once. Later sends and Close on the channel wait for it, so
+// nothing overtakes it.
 func (c *Channel) SendPrefix(ctx context.Context, typ byte, payload []byte) (int, error) {
 	select {
 	case c.sendSem <- struct{}{}:
@@ -295,9 +296,25 @@ func (c *Channel) SendPrefix(ctx context.Context, typ byte, payload []byte) (int
 		// Keep the send slot until the frame is written, so that a later
 		// frame (or CLOSE_CHANNEL) cannot overtake it.
 		go func() { <-it.done; release() }()
-		return n, ctx.Err()
+		return n, queuedError{ctx.Err()}
 	}
 }
+
+// ErrQueued is matched by the error SendPrefix returns when ctx ended after
+// its frame was queued: the frame will still be sent.
+var ErrQueued = errors.New("xumux: frame queued; it will still be sent")
+
+// queuedError is ctx's error after a frame was queued. It matches both
+// ErrQueued and the ctx error, and keeps a timeout a net.Error timeout.
+type queuedError struct{ err error }
+
+func (e queuedError) Error() string   { return e.err.Error() + " (frame queued; it will still be sent)" }
+func (e queuedError) Unwrap() []error { return []error{ErrQueued, e.err} }
+func (e queuedError) Timeout() bool {
+	t, ok := e.err.(interface{ Timeout() bool })
+	return ok && t.Timeout()
+}
+func (e queuedError) Temporary() bool { return e.Timeout() }
 
 // takeCredit waits for n bytes of send credit. With partial, it takes
 // whatever is available (at least 1 byte, at most n).
