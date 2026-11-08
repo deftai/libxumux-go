@@ -25,6 +25,9 @@ const (
 // ErrClosed is returned by operations on a closed session or channel.
 var ErrClosed = errors.New("xumux: closed")
 
+// errKeepaliveTimeout is the base-path loss a keepalive timeout reports.
+var errKeepaliveTimeout = errors.New("xumux: keepalive timeout")
+
 // Handler runs a channel the peer opened, once it is open. It is called in
 // its own goroutine.
 type Handler func(ch *Channel)
@@ -136,6 +139,7 @@ type outItem struct {
 	done    chan error // buffered; may be nil
 	after   func(err error)
 	isClose bool
+	data    bool  // queued in data (round-robin) rather than urgent
 	cost    int64 // bytes counted against MaxControlQueue
 }
 
@@ -151,11 +155,53 @@ func (it *outItem) finish(err error) {
 type pendingPing struct {
 	sent time.Time
 	rtt  chan time.Duration
+	lost bool // abandoned because the base path was lost (set before rtt closes)
+}
+
+// errPathLost is returned by Ping when the base path was lost, and the
+// session detached, before the PONG arrived.
+var errPathLost = errors.New("xumux: base path lost before the PONG arrived")
+
+// basePath is one instance of the base path (core §1.2): a FrameConn with
+// its own read and write loops. A session normally has one for its whole
+// life. An extension that keeps the connection alive when the base path is
+// lost (core §11.1) detaches it instead of closing the session, and later
+// attaches a new one under the same session.
+type basePath struct {
+	conn         FrameConn
+	wake         chan struct{} // wakes this path's writer; capacity 1
+	stop         chan struct{} // closed when the path is detached
+	closeWritten chan struct{} // closed when this path's writer stops
+	// preamble is written before anything queued: an extension's answer and
+	// retransmissions on a newly attached path. Guarded by s.mu.
+	preamble []Frame
+}
+
+func newBasePath(conn FrameConn) *basePath {
+	return &basePath{conn: conn, wake: make(chan struct{}, 1), stop: make(chan struct{}), closeWritten: make(chan struct{})}
+}
+
+// pathHooks is the seam through which an extension keeps a session alive
+// across the loss of its base path (core §11.1). Every method is called with
+// s.mu held. A session without hooks ends when its transport does.
+type pathHooks interface {
+	// pathLost reports whether to detach, rather than close, a session whose
+	// base path failed without a CLOSE exchange (err says how).
+	pathLost(err error) bool
+	// writing is called as the writer takes it from the queue to write it to
+	// the base path. It reports whether the extension keeps a copy of the
+	// frame to send again on the next path: such a frame counts as sent even
+	// if the write fails because the path was lost. Other frames that fail
+	// that way are queued again, at the front.
+	writing(it *outItem) (retained bool)
 }
 
 // Session is one xumux connection. Create it with [Connect] or [Accept].
 type Session struct {
-	conn   FrameConn
+	// path is the attached base path, or nil while detached. It is set before
+	// the handshake and changes only under mu.
+	path   *basePath
+	hooks  pathHooks // nil: transport loss ends the session
 	opts   Options
 	client bool
 	local  Limits
@@ -190,14 +236,11 @@ type Session struct {
 	rttProbedAt   time.Time // when auto-tuning last sent one
 
 	// Outbound scheduler, guarded by mu.
-	urgent       []*outItem
-	urgentBytes  int64 // bytes queued in urgent, for MaxControlQueue
-	data         map[uint16][]*outItem
-	rr           []uint16
-	windowDirty  bool
-	writeStopped bool
-	wake         chan struct{}
-	closeWritten chan struct{}
+	urgent      []*outItem
+	urgentBytes int64 // bytes queued in urgent, for MaxControlQueue
+	data        map[uint16][]*outItem
+	rr          []uint16
+	windowDirty bool
 
 	done chan struct{}
 }
@@ -206,10 +249,10 @@ func newSession(conn FrameConn, opts Options, client bool) *Session {
 	opts = opts.withDefaults()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
-		conn: conn, opts: opts, client: client, local: opts.Limits, epoch: time.Now(),
+		path: newBasePath(conn), opts: opts, client: client, local: opts.Limits, epoch: time.Now(),
 		ctx: ctx, cancel: cancel,
 		chans: map[uint16]*Channel{}, pendingRemote: map[uint16]bool{}, pings: map[uint32]*pendingPing{},
-		data: map[uint16][]*outItem{}, wake: make(chan struct{}, 1), closeWritten: make(chan struct{}),
+		data: map[uint16][]*outItem{},
 		done: make(chan struct{}),
 	}
 	s.lastRx.Store(time.Now().UnixNano())
@@ -338,7 +381,7 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 // readWelcome reads frames until WELCOME and validates it (core §3.1, §3.3).
 func (s *Session) readWelcome() (Welcome, error) {
 	for {
-		f, err := s.conn.ReadFrame(s.local.MaxFramePayload)
+		f, err := s.path.conn.ReadFrame(s.local.MaxFramePayload)
 		if err != nil {
 			return Welcome{}, s.abortHandshake(err)
 		}
@@ -650,8 +693,8 @@ func (s *Session) handOff(ctx context.Context, started time.Time, h FirstFrameHa
 	// The answer is bounded like WELCOME: if ctx expires before the handler
 	// returns, the transport is closed, which also unblocks a handler stuck
 	// writing to it.
-	stop := context.AfterFunc(hctx, func() { s.conn.Close() })
-	err := h(hctx, s.conn, f)
+	stop := context.AfterFunc(hctx, func() { s.path.conn.Close() })
+	err := h(hctx, s.path.conn, f)
 	if !stop() {
 		// The deadline closed the transport; whatever the handler saw, the
 		// cause is the deadline.
@@ -667,7 +710,7 @@ func (s *Session) handOff(ctx context.Context, started time.Time, h FirstFrameHa
 	if errors.As(err, &r) {
 		return s.abortHandshake(&ProtocolError{Code: r.Code, Message: r.Reason})
 	}
-	s.conn.Close()
+	s.path.conn.Close()
 	return err
 }
 
@@ -679,9 +722,9 @@ func (s *Session) handshakeDeadline(ctx context.Context) (stop func() bool) {
 		fired.Store(true)
 		if !s.client {
 			// Nothing else has been written yet, so this cannot interleave (core §3.1).
-			_ = s.conn.WriteFrame(controlFrame(TypeClose, closeMsg{Code: CodeHelloTimeout, Reason: "no HELLO received"}))
+			_ = s.path.conn.WriteFrame(controlFrame(TypeClose, closeMsg{Code: CodeHelloTimeout, Reason: "no HELLO received"}))
 		}
-		s.conn.Close()
+		s.path.conn.Close()
 	}
 	t := time.AfterFunc(s.opts.HandshakeTimeout, fire)
 	cancelCtx := context.AfterFunc(ctx, fire)
@@ -697,11 +740,11 @@ func (s *Session) handshakeDeadline(ctx context.Context) (stop func() bool) {
 func (s *Session) abortHandshake(err error) error {
 	var pe *ProtocolError
 	if !errors.As(err, &pe) {
-		s.conn.Close()
+		s.path.conn.Close()
 		return err
 	}
 	if pe.Transport {
-		s.conn.Close()
+		s.path.conn.Close()
 		return pe
 	}
 	s.tryClose(pe.Code, pe.Message)
@@ -714,21 +757,21 @@ func (s *Session) remoteHandshakeClose(payload []byte) error {
 	if err != nil {
 		return s.abortHandshake(err)
 	}
-	_ = s.conn.WriteFrame(controlFrame(TypeClose, closeMsg{Code: m.Code}))
-	_ = s.conn.CloseWrite()
-	s.conn.Close()
+	_ = s.path.conn.WriteFrame(controlFrame(TypeClose, closeMsg{Code: m.Code}))
+	_ = s.path.conn.CloseWrite()
+	s.path.conn.Close()
 	return &CloseError{Code: m.Code, Reason: m.Reason, Remote: true}
 }
 
 // tryClose sends CLOSE, then waits briefly for the peer's CLOSE or EOF.
 func (s *Session) tryClose(code int, reason string) {
-	_ = s.conn.WriteFrame(controlFrame(TypeClose, closeMsg{Code: code, Reason: reason}))
-	_ = s.conn.CloseWrite()
+	_ = s.path.conn.WriteFrame(controlFrame(TypeClose, closeMsg{Code: code, Reason: reason}))
+	_ = s.path.conn.CloseWrite()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
-			f, err := s.conn.ReadFrame(s.local.MaxFramePayload)
+			f, err := s.path.conn.ReadFrame(s.local.MaxFramePayload)
 			if err != nil || (f.IsControl() && f.Type == TypeClose) {
 				return
 			}
@@ -738,15 +781,92 @@ func (s *Session) tryClose(code int, reason string) {
 	case <-done:
 	case <-time.After(s.opts.CloseTimeout):
 	}
-	s.conn.Close()
+	s.path.conn.Close()
 }
 
 func (s *Session) start() {
-	go s.writeLoop()
-	go s.readLoop()
+	s.runPath(s.path)
 	if s.pingInterval > 0 {
 		go s.keepalive()
 	}
+}
+
+func (s *Session) runPath(p *basePath) {
+	go s.writeLoop(p)
+	go s.readLoop(p)
+}
+
+// ─── Base path: detach and attach ───────────────────────────────────────────
+
+// lostLocked handles the loss of base path p while the session is open: it
+// detaches p and reports true if the hooks keep the session alive.
+func (s *Session) lostLocked(p *basePath, err error) bool {
+	if p == nil || s.path != p || s.state != stateOpen || s.hooks == nil || !s.hooks.pathLost(err) {
+		return false
+	}
+	s.detachLocked(p)
+	return true
+}
+
+// detachLocked takes base path p off the session without closing the
+// session (core §11.1): its loops stop, its transport is closed without a
+// CLOSE, and the session keeps its channels and queues until a new path is
+// attached. Outstanding PINGs are abandoned, not counted as lost, and
+// keepalive is suspended (session-resume §6).
+func (s *Session) detachLocked(p *basePath) {
+	if p == nil || s.path != p {
+		return
+	}
+	s.path = nil
+	close(p.stop)
+	go p.conn.Close()
+	s.keepaliveAt = time.Time{}
+	abandon := func(pings map[uint32]*pendingPing) {
+		for tok, pp := range pings {
+			delete(pings, tok)
+			pp.lost = true
+			close(pp.rtt)
+		}
+	}
+	abandon(s.pings)
+	for _, c := range s.chans {
+		abandon(c.pings)
+	}
+}
+
+// attachLocked puts conn under the session as its base path, replacing the
+// current one if there is one (which is detached first, as on a takeover).
+// preamble is written before anything queued.
+func (s *Session) attachLocked(conn FrameConn, preamble []Frame) error {
+	if s.state != stateOpen {
+		return ErrClosed
+	}
+	if s.path != nil {
+		s.detachLocked(s.path)
+	}
+	p := newBasePath(conn)
+	p.preamble = preamble
+	s.path = p
+	s.lastRx.Store(time.Now().UnixNano())
+	s.keepaliveAt = time.Time{}
+	s.runPath(p)
+	s.signalWriter()
+	return nil
+}
+
+// requeueLocked puts back, at the front of its queue, a frame whose write
+// failed because the base path was lost, so that the next path sends it.
+func (s *Session) requeueLocked(it *outItem) {
+	if it.data {
+		q := s.data[it.f.Channel]
+		if len(q) == 0 {
+			s.rr = append([]uint16{it.f.Channel}, s.rr...)
+		}
+		s.data[it.f.Channel] = append([]*outItem{it}, q...)
+		return
+	}
+	s.urgentBytes += it.cost
+	s.urgent = append([]*outItem{it}, s.urgent...)
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -889,15 +1009,20 @@ func (s *Session) Close(ctx context.Context, code int, reason string) error {
 
 // ─── Receive path ───────────────────────────────────────────────────────────
 
-func (s *Session) readLoop() {
+func (s *Session) readLoop(p *basePath) {
 	for {
-		f, err := s.conn.ReadFrame(s.local.MaxFramePayload)
+		f, err := p.conn.ReadFrame(s.local.MaxFramePayload)
 		if err != nil {
-			s.readFailed(err)
+			s.readFailed(p, err)
+			return
+		}
+		s.mu.Lock()
+		if s.path != p {
+			// Detached (or taken over): stop reading this transport.
+			s.mu.Unlock()
 			return
 		}
 		s.lastRx.Store(time.Now().UnixNano())
-		s.mu.Lock()
 		if err := s.handleFrameLocked(f); err != nil {
 			s.handleErrLocked(err)
 		}
@@ -909,22 +1034,26 @@ func (s *Session) readLoop() {
 	}
 }
 
-func (s *Session) readFailed(err error) {
+func (s *Session) readFailed(p *basePath, err error) {
 	var pe *ProtocolError
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
+	case s.path != p:
+		// A path that was already detached.
 	case s.state == stateClosed:
 	case errors.As(err, &pe) && pe.Transport:
 		s.finishLocked(CloseError{Code: pe.Code, Reason: pe.Message})
 	case errors.As(err, &pe):
 		// The input cannot be parsed further: send CLOSE, then finish.
 		s.beginCloseLocked(pe.Code, pe.Message, false)
-		s.finishAfterCloseWrittenLocked()
+		s.finishAfterCloseWrittenLocked(p)
 	case s.state == stateClosing:
 		// The peer half-closed after its CLOSE (core §9.1). Our CLOSE (the
 		// reply, or our own) may still be queued: let it reach the wire.
-		s.finishAfterCloseWrittenLocked()
+		s.finishAfterCloseWrittenLocked(p)
+	case s.lostLocked(p, err):
+		// Detached: an extension keeps the session for a new base path.
 	default:
 		reason := "peer closed the transport without a CLOSE"
 		if !errors.Is(err, io.EOF) {
@@ -936,8 +1065,8 @@ func (s *Session) readFailed(err error) {
 
 // finishAfterCloseWrittenLocked waits (unlocked, bounded by CloseTimeout)
 // for the queued CLOSE to be written, then finishes the session.
-func (s *Session) finishAfterCloseWrittenLocked() {
-	written := s.closeWritten
+func (s *Session) finishAfterCloseWrittenLocked(p *basePath) {
+	written := p.closeWritten
 	s.mu.Unlock()
 	select {
 	case <-written:
@@ -1378,6 +1507,12 @@ func (s *Session) beginCloseLocked(code int, reason string, remote bool) {
 	}
 	s.state = stateClosing
 	s.closeInfo = CloseError{Code: code, Reason: reason, Remote: remote}
+	if s.path == nil {
+		// Detached: there is no transport to send CLOSE on, and closing ends
+		// the session for good.
+		s.finishLocked(s.closeInfo)
+		return
+	}
 	for id := range s.data {
 		s.dropQueuedLocked(id, ErrClosed)
 	}
@@ -1433,7 +1568,9 @@ func (s *Session) finishLocked(info CloseError) {
 	}
 	close(s.done)
 	s.signalWriter()
-	go s.conn.Close()
+	if p := s.path; p != nil {
+		go p.conn.Close()
+	}
 }
 
 // ─── Outbound scheduler ─────────────────────────────────────────────────────
@@ -1444,7 +1581,7 @@ func (s *Session) enqueueLocked(f Frame, after func(error), dataChannel bool) (*
 	if s.state != stateOpen {
 		return nil, ErrClosed
 	}
-	it := &outItem{f: f, after: after}
+	it := &outItem{f: f, after: after, data: dataChannel}
 	if dataChannel {
 		it.done = make(chan error, 1)
 		q := s.data[f.Channel]
@@ -1486,9 +1623,13 @@ func (s *Session) dropQueuedLocked(ch uint16, err error) {
 	}
 }
 
+// signalWriter wakes the attached path's writer. Call it with s.mu held.
 func (s *Session) signalWriter() {
+	if s.path == nil {
+		return
+	}
 	select {
-	case s.wake <- struct{}{}:
+	case s.path.wake <- struct{}{}:
 	default:
 	}
 }
@@ -1531,46 +1672,80 @@ func (s *Session) nextLocked() *outItem {
 	return it
 }
 
-func (s *Session) writeLoop() {
+// writeLoop writes the frames of base path p until p is detached or the
+// session ends.
+func (s *Session) writeLoop(p *basePath) {
 	defer func() {
 		s.mu.Lock()
-		s.writeStopped = true
-		select {
-		case <-s.closeWritten:
-		default:
-			close(s.closeWritten)
-		}
+		close(p.closeWritten)
 		s.mu.Unlock()
 	}()
 	for {
+		var it *outItem
+		retained := false
 		s.mu.Lock()
-		it := s.nextLocked()
 		for it == nil {
+			if s.path != p {
+				s.mu.Unlock()
+				return
+			}
+			if len(p.preamble) > 0 {
+				it = &outItem{f: p.preamble[0]}
+				p.preamble = p.preamble[1:]
+				// Already counted and kept by the extension that attached p.
+				retained = true
+				break
+			}
+			if it = s.nextLocked(); it != nil {
+				if s.hooks != nil {
+					retained = s.hooks.writing(it)
+				}
+				break
+			}
 			if s.state == stateClosed {
 				s.mu.Unlock()
 				return
 			}
 			s.mu.Unlock()
-			<-s.wake
+			select {
+			case <-p.wake:
+			case <-p.stop:
+			}
 			s.mu.Lock()
-			it = s.nextLocked()
 		}
 		s.mu.Unlock()
 
-		err := s.conn.WriteFrame(it.f)
-		it.finish(err)
+		err := p.conn.WriteFrame(it.f)
 		if err != nil {
 			s.mu.Lock()
+			s.lostLocked(p, err)
+			if s.path != p && s.state != stateClosed {
+				// The path was lost and the session detached (now, or while
+				// the write was in progress). The next path sends the frame:
+				// from the extension's copy, or from the queue.
+				if !retained {
+					s.requeueLocked(it)
+					s.mu.Unlock()
+					return
+				}
+				s.mu.Unlock()
+				it.finish(nil)
+				return
+			}
 			info := s.closeInfo
 			if s.state == stateOpen {
 				info = CloseError{Code: CodeGoingAway, Reason: "transport write failed: " + err.Error(), Lost: true}
 			}
+			s.mu.Unlock()
+			it.finish(err)
+			s.mu.Lock()
 			s.finishLocked(info)
 			s.mu.Unlock()
 			return
 		}
+		it.finish(nil)
 		if it.isClose {
-			_ = s.conn.CloseWrite()
+			_ = p.conn.CloseWrite()
 			return
 		}
 	}
@@ -1611,6 +1786,9 @@ func (s *Session) ping(ctx context.Context, c *Channel) (time.Duration, error) {
 	select {
 	case rtt, ok := <-p.rtt:
 		if !ok {
+			if p.lost {
+				return 0, errPathLost
+			}
 			return 0, ErrClosed
 		}
 		return rtt, nil
@@ -1640,11 +1818,16 @@ func (s *Session) keepalive() {
 		last := time.Unix(0, s.lastRx.Load())
 		s.mu.Lock()
 		switch {
-		case s.state != stateOpen:
+		case s.state != stateOpen || s.path == nil:
+			// Keepalive is suspended while detached (session-resume §6).
 		case !s.keepaliveAt.IsZero():
 			if last.Before(s.keepaliveAt) && now.Sub(s.keepaliveAt) >= s.pingTimeout {
-				// The peer is gone; close the transport without waiting (core §8.2).
-				s.finishLocked(CloseError{Code: CodeKeepaliveTimeout, Reason: "peer stopped responding"})
+				// The peer is gone; close the transport without waiting (core
+				// §8.2). An extension that keeps the session detaches it
+				// instead, without CLOSE 4008 (session-resume §6).
+				if !s.lostLocked(s.path, errKeepaliveTimeout) {
+					s.finishLocked(CloseError{Code: CodeKeepaliveTimeout, Reason: "peer stopped responding"})
+				}
 			}
 		case now.Sub(last) >= s.pingInterval:
 			s.keepaliveAt = now

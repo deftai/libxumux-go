@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+
+- Internal: a `Session` is no longer tied to one `FrameConn`. Each base path (core §1.2) has its own read and write loops, and an unexported seam lets an extension detach the session when its transport is lost, instead of closing it, and attach a new transport under the live session (the core §11.1 hook that session-resume/1 uses). Without such an extension nothing changes: losing the transport ends the session as before.
+
 ## [0.4.0] - 2026-11-08
 
 Implements xumux core 0.3 (spec tag `v0.3.0-draft`). 0.x minors are incompatible, so this release cannot connect to a 0.2 peer, including libxumux (TypeScript) up to v0.4.0 and libxumux-go up to v0.3.0.
