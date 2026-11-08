@@ -14,7 +14,7 @@ The package name is `xumux`:
 import xumux "github.com/deftai/libxumux-go"
 ```
 
-The only dependency is the standard library. Tests also use testify and `golang.org/x/net/nettest`.
+The only dependency is the standard library. Tests also use testify and `golang.org/x/net/nettest`. WebSocket support is in the separate [`ws`](#websocket-the-ws-module) module.
 
 ## Use
 
@@ -79,6 +79,36 @@ http.Serve(l, handler)
 
 `pipe.Conn` passes `nettest.TestConn`, the conformance suite the Go team uses for `net.Conn` implementations.
 
+## WebSocket: the `ws` module
+
+[`ws`](ws) implements the xumux [WebSocket binding](https://github.com/deftai/xumux/blob/main/spec/bindings/websocket.md): subprotocol `xumux`, one frame per binary message, text messages refused with CLOSE 1002, and a WebSocket close of 1000 (1001 when going away) after the xumux CLOSE. It is a separate module, so the core keeps no dependencies; it uses [`github.com/coder/websocket`](https://github.com/coder/websocket).
+
+```sh
+go get github.com/deftai/libxumux-go/ws
+```
+
+```go
+import "github.com/deftai/libxumux-go/ws"
+
+// Client
+fc, _, err := ws.Dial(ctx, "wss://example.com/xumux", nil)
+s, res, err := xumux.Connect(ctx, fc, cfg, xumux.Options{})
+
+// Server: Handler upgrades, refuses clients without the subprotocol (1008),
+// and closes the connection when the callback returns. ws.Accept(w, r, opts)
+// does the upgrade alone.
+http.Handle("/xumux", ws.Handler(nil, func(fc xumux.FrameConn, r *http.Request) {
+	s, hello, err := xumux.Accept(r.Context(), fc, xumux.ServerConfig{}, opts)
+	if err == nil {
+		<-s.Done()
+	}
+}))
+```
+
+Set `DialOptions.MaxFramePayload` / `AcceptOptions.MaxFramePayload` to the session's `Limits.MaxFramePayload` if you change it; it sizes the WebSocket read limit. Cross-origin browser requests are refused unless listed in `AcceptOptions.OriginPatterns`.
+
+The module is versioned on its own, with tags of the form `ws/vX.Y.Z` (Go's rule for nested modules), and `ws/go.mod` requires a released core version. A change that needs new core API lands in two steps: release the core, then bump the requirement in `ws/go.mod` and tag `ws/v…`.
+
 ## What's implemented
 
 - Framing over byte streams (with the `XMUX` magic) and message transports.
@@ -106,7 +136,8 @@ A peer can't make this side use memory without limit. The `Options` defaults are
 ## Development
 
 ```sh
-make check                                   # fmt, vet, race tests, coverage
+make check                                   # fmt, vet, race tests, coverage, ws module
+make test/ws                                 # the nested ws module only
 make test/interop LIBXUMUX_DIR=../libxumux   # against a built libxumux checkout
 make test/fuzz FUZZTIME=30s                  # every fuzz target
 ```
