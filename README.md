@@ -78,6 +78,38 @@ Parameters for extensions that are not accepted are ignored, and a server never 
 
 An extension can also claim the first frame of a new transport, to continue an existing connection instead of starting one with HELLO (core §3.1). `ServerConfig.FirstFrames` maps a control type in 0x30–0x7F to a `FirstFrameHandler`, which answers in place of WELCOME and takes the transport; `Accept` then returns `ErrFirstFrameHandled`. Without a handler for its type, a first frame other than HELLO closes with 1002.
 
+## Session resume
+
+[`session-resume/1`](https://github.com/deftai/xumux/blob/main/spec/extensions/session-resume.md) lets a client that loses its transport (Wi-Fi to cellular, sleep and wake, a proxy restart) continue the **same** session on a new one: the same `*Session` and `*Channel` values, with no message lost or duplicated. Both sides opt in:
+
+```go
+// Server: one ResumeServer for every Accept. It answers RESUME on new
+// transports, and Accept returns ErrFirstFrameHandled for those.
+rs := xumux.NewResumeServer(xumux.ResumeServerOptions{Timeout: 2 * time.Minute})
+s, hello, err := xumux.Accept(ctx, fc, xumux.ServerConfig{
+	Resume: rs,
+	// Required if the server authenticates clients: check that a RESUME
+	// comes from the identity that s was authenticated as.
+	AuthorizeResume: func(ctx context.Context, req *xumux.ResumeRequest, s *xumux.Session) error { ... },
+}, opts)
+if errors.Is(err, xumux.ErrFirstFrameHandled) {
+	return // a resumed session took this transport
+}
+
+// Client: Redial opens a new transport to the same server.
+s, res, err := xumux.Connect(ctx, fc, xumux.ClientConfig{
+	Resume: &xumux.ResumeClient{
+		Redial:     func(ctx context.Context) (xumux.FrameConn, error) { ... },
+		OnFallback: func(s *xumux.Session, res *xumux.ConnectResult, err error) { ... }, // session lost: a new one
+	},
+}, opts)
+```
+
+- **While detached**, sends wait (flow control still applies), keepalive is suspended, and `Session.Detached()` is true. A keepalive timeout also detaches rather than closing with 4008. The client redials with backoff until the server's `resumeTimeout`. The server keeps the session at least that long (`ResumeServerOptions.Timeout`, default 120 s), and at most `MaxDetached` detached sessions in all.
+- **What carries over.** Each side keeps a copy of every frame it sent on channel 0 and on reliable, ordered channels until the peer's RECEIPT covers it, and retransmits what the peer lacks after a resume. Every channel in this library is on the base path, so all of them carry over. A message cut off by the drop completes from the retransmitted fragments.
+- **Tokens** are 128-bit, single use, compared in constant time, and kept in memory only. Each resume issues a new one, and the server can rotate them (`RotateEvery`). They are bearer secrets: use an encrypted transport except on local bindings (session-resume §8).
+- **Refusals.** If the server no longer has the session (4100, 4101), cannot replay it (4102, 4103), no longer implements the extension (1002) or speaks another version (4006), the session ends with that code. With `OnFallback`, the library then connects again with HELLO. Closing a session, from either side, ends it for good.
+
 ## Streams: `net.Conn` over xumux
 
 A core channel carries typed messages. For byte streams, the [`pipe`](pipe) package implements the [`pipe/1`](https://github.com/deftai/xumux/blob/main/spec/profiles/pipe.md) profile, where each pipe is a `net.Conn` with `CloseWrite` for half-close. `io.Copy`, `bufio`, `crypto/tls` and `net/http` work over it unchanged:
@@ -168,9 +200,10 @@ s, res, err := webrtc.Connect(ctx, t, cfg, opts)   // waits for the DataChannel 
 - Flow control: per-channel credit with receive-window auto-tuning, bounded per connection.
 - The WebRTC binding over one DataChannel (module `webrtc`).
 - Probes and keepalive: PING/PONG per channel and per connection.
+- The `session-resume/1` extension: detach on transport loss, resume on a new transport with retransmission, token rotation and takeover.
 - Close codes and errors as in the spec.
 
-**Not implemented yet:** the `webrtc-multichannel/1` and `session-resume/1` extensions, and the QUIC binding.
+**Not implemented yet:** the `webrtc-multichannel/1` extension and the QUIC binding.
 
 ## Limits
 
