@@ -301,24 +301,37 @@ func TestFirstFramesTypeRange(t *testing.T) {
 }
 
 func TestFirstFrameHandlerDeadline(t *testing.T) {
-	lib, raw := rawPair(t, "stream")
-	o := testOpts
-	o.HandshakeTimeout = 200 * time.Millisecond
-	errc := make(chan error, 1)
-	go func() {
-		_, _, err := Accept(context.Background(), lib, ServerConfig{FirstFrames: map[byte]FirstFrameHandler{
-			typeTestResume: func(ctx context.Context, _ FrameConn, _ Frame) error {
-				<-ctx.Done()
-				return ctx.Err()
-			},
-		}}, o)
-		errc <- err
-	}()
-	raw.send(Frame{Channel: ControlChannel, Type: typeTestResume, Payload: []byte(`{}`)})
-	select {
-	case err := <-errc:
-		assert.ErrorIs(t, err, context.DeadlineExceeded)
-	case <-time.After(3 * time.Second):
-		t.Fatal("handler context did not expire at the handshake timeout")
+	cases := map[string]FirstFrameHandler{
+		// Honours ctx.
+		"returns at ctx expiry": func(ctx context.Context, _ FrameConn, _ Frame) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		// Ignores ctx and blocks on the transport: closing it unblocks the handler.
+		"blocked on the transport": func(_ context.Context, conn FrameConn, _ Frame) error {
+			_, _ = conn.ReadFrame(MaxWindow)
+			return nil
+		},
+	}
+	for name, h := range cases {
+		t.Run(name, func(t *testing.T) {
+			lib, raw := rawPair(t, "stream")
+			o := testOpts
+			o.HandshakeTimeout = 200 * time.Millisecond
+			errc := make(chan error, 1)
+			go func() {
+				_, _, err := Accept(context.Background(), lib, ServerConfig{FirstFrames: map[byte]FirstFrameHandler{typeTestResume: h}}, o)
+				errc <- err
+			}()
+			raw.send(Frame{Channel: ControlChannel, Type: typeTestResume, Payload: []byte(`{}`)})
+			select {
+			case err := <-errc:
+				assert.ErrorIs(t, err, context.DeadlineExceeded)
+				assert.NotErrorIs(t, err, ErrFirstFrameHandled)
+			case <-time.After(3 * time.Second):
+				t.Fatal("Accept outlived the handshake timeout")
+			}
+			raw.waitEnded()
+		})
 	}
 }

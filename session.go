@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -451,7 +452,8 @@ type ServerConfig struct {
 // extension-defined first frame (core §3.1). It sends the answer the
 // extension defines, which takes the place of WELCOME, and from then on
 // owns conn. ctx expires at the handshake timeout, which bounds the answer
-// as it does WELCOME.
+// as it does WELCOME: if the handler has not returned by then, conn is
+// closed and Accept fails with ctx's error.
 //
 // If it returns nil, Accept returns [ErrFirstFrameHandled] and no Session.
 // If it returns a *Refusal, Accept refuses the connection with CLOSE and
@@ -644,7 +646,17 @@ func (s *Session) checkHello(h Hello) error {
 func (s *Session) handOff(ctx context.Context, started time.Time, h FirstFrameHandler, f Frame) error {
 	hctx, cancel := context.WithDeadline(ctx, started.Add(s.opts.HandshakeTimeout))
 	defer cancel()
+	// The answer is bounded like WELCOME: if ctx expires before the handler
+	// returns, the transport is closed, which also unblocks a handler stuck
+	// writing to it.
+	stop := context.AfterFunc(hctx, func() { s.conn.Close() })
 	err := h(hctx, s.conn, f)
+	if !stop() {
+		if err == nil || errors.Is(err, net.ErrClosed) {
+			err = fmt.Errorf("xumux: first-frame answer: %w", context.Cause(hctx))
+		}
+		return err
+	}
 	if err == nil {
 		return ErrFirstFrameHandled
 	}
