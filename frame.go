@@ -1,4 +1,4 @@
-// Package xumux implements the xumux 0.2 core protocol: framing, the
+// Package xumux implements the xumux 0.3 core protocol: framing, the
 // HELLO/WELCOME handshake, channels, per-channel flow control,
 // fragmentation, probes and keepalive.
 //
@@ -48,7 +48,7 @@ const (
 var Magic = [4]byte{'X', 'M', 'U', 'X'}
 
 // Version is the protocol version this package implements.
-var Version = [3]int{0, 2, 0}
+var Version = [3]int{0, 3, 0}
 
 // Close and error codes.
 const (

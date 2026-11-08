@@ -85,10 +85,21 @@ func TestAuthorizeRefusal(t *testing.T) {
 }
 
 func TestVersionMismatch(t *testing.T) {
+	// 0.x minors are mutually incompatible, so 0.2 is refused like 0.1 (core §3.5).
+	for _, v := range [][]int{{0, 1, 0}, {0, 2, 0}, {0, 4, 0}, {1, 3, 0}} {
+		lib, raw := rawPair(t, "stream")
+		go Accept(context.Background(), lib, ServerConfig{}, testOpts)
+		raw.send(ctrl(TypeHello, map[string]any{"version": v}))
+		assert.Equal(t, CodeVersionMismatch, raw.closeCode(), "%v", v)
+	}
+}
+
+func TestVersionPatchCompatible(t *testing.T) {
 	lib, raw := rawPair(t, "stream")
 	go Accept(context.Background(), lib, ServerConfig{}, testOpts)
-	raw.send(ctrl(TypeHello, map[string]any{"version": []int{0, 1, 0}}))
-	assert.Equal(t, CodeVersionMismatch, raw.closeCode())
+	raw.send(ctrl(TypeHello, map[string]any{"version": []int{Version[0], Version[1], Version[2] + 7}}))
+	w := jsonOf(t, raw.control(TypeWelcome))
+	assert.Equal(t, []any{float64(0), float64(3), float64(0)}, w["version"])
 }
 
 func TestHelloTimeout(t *testing.T) {
@@ -103,11 +114,11 @@ func TestHelloTimeout(t *testing.T) {
 
 func TestClientRejectsBadWelcome(t *testing.T) {
 	cases := map[string]map[string]any{
-		"unanswered channel":  {"version": []int{0, 2, 0}},
-		"unrequested ext":     {"version": []int{0, 2, 0}, "extensions": []string{"x/1"}, "rejected": []any{map[string]any{"id": 1, "code": 4010}}},
-		"incompatible":        {"version": []int{0, 3, 0}, "rejected": []any{map[string]any{"id": 1, "code": 4010}}},
-		"duplicate answer":    {"version": []int{0, 2, 0}, "channels": []any{map[string]any{"id": 1, "reliable": true, "ordered": true}}, "rejected": []any{map[string]any{"id": 1, "code": 4010}}},
-		"invalid limits 4001": {"version": []int{0, 2, 0}, "maxFramePayload": 100},
+		"unanswered channel":  {"version": Version},
+		"unrequested ext":     {"version": Version, "extensions": []string{"x/1"}, "rejected": []any{map[string]any{"id": 1, "code": 4010}}},
+		"incompatible":        {"version": []int{0, 2, 0}, "rejected": []any{map[string]any{"id": 1, "code": 4010}}},
+		"duplicate answer":    {"version": Version, "channels": []any{map[string]any{"id": 1, "reliable": true, "ordered": true}}, "rejected": []any{map[string]any{"id": 1, "code": 4010}}},
+		"invalid limits 4001": {"version": Version, "maxFramePayload": 100},
 	}
 	for name, w := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -495,7 +506,7 @@ func TestFramesInSameWriteAsWelcome(t *testing.T) {
 		done <- err
 	}()
 	raw.control(TypeHello)
-	w := ctrl(TypeWelcome, map[string]any{"version": []int{0, 2, 0}}).Encode()
+	w := ctrl(TypeWelcome, map[string]any{"version": Version}).Encode()
 	o := ctrl(TypeOpenChannel, map[string]any{"id": 2, "name": "srv", "reliable": true, "ordered": true}).Encode()
 	raw.sendBytes(append(w, o...), false)
 	require.NoError(t, <-done)

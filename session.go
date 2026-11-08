@@ -2,6 +2,7 @@ package xumux
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -163,10 +164,16 @@ type Session struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	requestedExt []string      // client: extensions asked for in HELLO
-	pingInterval time.Duration // effective; 0 = disabled
-	pingTimeout  time.Duration
-	lastRx       atomic.Int64 // UnixNano of the last received frame
+	requestedExt []string // client: extensions asked for in HELLO
+	checkExt     func(name string, params json.RawMessage) error
+	// Negotiated extensions and their parameters (core §3.8), set by the
+	// handshake and read-only afterwards.
+	extensions     []string
+	localExtParams map[string]json.RawMessage
+	peerExtParams  map[string]json.RawMessage
+	pingInterval   time.Duration // effective; 0 = disabled
+	pingTimeout    time.Duration
+	lastRx         atomic.Int64 // UnixNano of the last received frame
 
 	mu            sync.Mutex
 	state         sessionState
@@ -225,7 +232,16 @@ type ChannelSpec struct {
 type ClientConfig struct {
 	Application string
 	Extensions  []string
-	Auth        map[string]any
+	// ExtensionParams are sent in HELLO as extensionParams (core §3.8):
+	// parameters for requested extensions, keyed by extension name. Each
+	// value must be a valid JSON value as its extension defines it.
+	ExtensionParams map[string]json.RawMessage
+	// CheckExtensionParams, if set, validates the server's parameters for
+	// each extension WELCOME accepts. params is WELCOME's extensionParams
+	// value for name, or nil if it has none. An error closes the connection
+	// with 4001 (core §3.8), and Connect fails.
+	CheckExtensionParams func(name string, params json.RawMessage) error
+	Auth                 map[string]any
 	// Channels to open during the handshake.
 	Channels []ChannelSpec
 }
@@ -249,10 +265,10 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 		interval = 0
 	}
 	hello := Hello{
-		Version: Version, Application: cfg.Application, Extensions: cfg.Extensions, Limits: s.local,
-		PingInterval: interval.Seconds(), PingTimeout: s.opts.PingTimeout.Seconds(), Auth: cfg.Auth,
+		Version: Version, Application: cfg.Application, Extensions: cfg.Extensions, ExtensionParams: cfg.ExtensionParams,
+		Limits: s.local, PingInterval: interval.Seconds(), PingTimeout: s.opts.PingTimeout.Seconds(), Auth: cfg.Auth,
 	}
-	s.requestedExt = cfg.Extensions
+	s.requestedExt, s.checkExt = cfg.Extensions, cfg.CheckExtensionParams
 	order := make([]*Channel, len(cfg.Channels))
 	for i, spec := range cfg.Channels {
 		r := spec.request(uint16(2*i + 1))
@@ -260,8 +276,14 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 		order[i] = s.newChannel(r, true, chanOpening)
 	}
 
+	helloFrame, err := encodeControl(TypeHello, hello)
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+
 	stop := s.handshakeDeadline(ctx)
-	if err := conn.WriteFrame(controlFrame(TypeHello, hello)); err != nil {
+	if err := conn.WriteFrame(helloFrame); err != nil {
 		stop()
 		conn.Close()
 		return nil, nil, err
@@ -276,6 +298,9 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 	}
 
 	s.remote = w.Limits
+	s.extensions = w.Extensions
+	s.localExtParams = paramsFor(cfg.ExtensionParams, w.Extensions)
+	s.peerExtParams = paramsFor(w.ExtensionParams, w.Extensions)
 	s.pingInterval = time.Duration(w.PingInterval * float64(time.Second))
 	s.pingTimeout = time.Duration(w.PingTimeout * float64(time.Second))
 	s.start()
@@ -358,6 +383,12 @@ func (s *Session) checkWelcome(w Welcome) error {
 		if !slices.Contains(s.requestedExt, e) {
 			return protoErr(CodeProtocolError, "WELCOME accepted extension %q that was not requested", e)
 		}
+		// Keys for extensions WELCOME does not accept are ignored (core §3.8).
+		if s.checkExt != nil {
+			if err := s.checkExt(e, w.ExtensionParams[e]); err != nil {
+				return protoErr(CodeInvalidMessage, "WELCOME extensionParams for %q: %v", e, err)
+			}
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -394,9 +425,65 @@ func refusalIDs(r []ChannelRefusal) []uint16 {
 type ServerConfig struct {
 	// Extensions this server supports; WELCOME accepts the overlap.
 	Extensions []string
+	// NegotiateExtension, if set, is called after Authorize for each
+	// extension in Extensions that the client requested. params is the
+	// client's extensionParams value for name, or nil if it sent none.
+	// Return the parameters to send for name in WELCOME (nil for none), or
+	// an error to leave the extension out of WELCOME, as a server does with
+	// parameters it cannot accept (core §3.8). If NegotiateExtension is nil,
+	// every requested extension in Extensions is accepted without
+	// parameters. The client's parameters for extensions that are not
+	// accepted are never passed on.
+	NegotiateExtension func(ctx context.Context, name string, params json.RawMessage) (json.RawMessage, error)
 	// Authorize may refuse the connection. A *Refusal chooses the code,
 	// any other error refuses with 4000 (AUTH_FAILED).
 	Authorize func(ctx context.Context, h *Hello) error
+	// FirstFrames lets an extension claim the first frame of a transport
+	// (core §3.1): a control message, of a type in 0x30–0x7F allocated to
+	// the extension, that continues an existing connection on a new
+	// transport instead of starting one with HELLO (session-resume/1's
+	// RESUME, for example). With no handler for a first frame's type, a
+	// first frame other than HELLO closes the transport with 1002.
+	FirstFrames map[byte]FirstFrameHandler
+}
+
+// FirstFrameHandler takes over a transport whose first frame f is an
+// extension-defined first frame (core §3.1). It sends the answer the
+// extension defines, which takes the place of WELCOME, and from then on
+// owns conn. ctx expires at the handshake timeout, which bounds the answer
+// as it does WELCOME.
+//
+// If it returns nil, Accept returns [ErrFirstFrameHandled] and no Session.
+// If it returns a *Refusal, Accept refuses the connection with CLOSE and
+// that code (the extension's own codes are in 4100–4499); any other error
+// closes conn without CLOSE. In both cases the handler must not have
+// written to conn.
+type FirstFrameHandler func(ctx context.Context, conn FrameConn, f Frame) error
+
+// ErrFirstFrameHandled is returned by Accept when a [FirstFrameHandler]
+// took the transport: the connection it continues is not a new Session.
+var ErrFirstFrameHandled = errors.New("xumux: transport taken by an extension's first-frame handler")
+
+// MinExtensionControlType and MaxExtensionControlType bound the control
+// types an extension may define (core §11.1).
+const (
+	MinExtensionControlType byte = 0x30
+	MaxExtensionControlType byte = 0x7F
+)
+
+// paramsFor returns the entries of params for the extensions in accepted,
+// or nil if there are none.
+func paramsFor(params map[string]json.RawMessage, accepted []string) map[string]json.RawMessage {
+	var out map[string]json.RawMessage
+	for _, e := range accepted {
+		if p, ok := params[e]; ok {
+			if out == nil {
+				out = map[string]json.RawMessage{}
+			}
+			out[e] = p
+		}
+	}
+	return out
 }
 
 // Accept performs the server handshake on conn. HELLO channels are
@@ -407,6 +494,13 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 		conn.Close()
 		return nil, nil, fmt.Errorf("xumux: invalid local limits: %w", err)
 	}
+	for typ := range cfg.FirstFrames {
+		if typ < MinExtensionControlType || typ > MaxExtensionControlType {
+			conn.Close()
+			return nil, nil, fmt.Errorf("xumux: FirstFrames type %#x is outside 0x30-0x7F", typ)
+		}
+	}
+	started := time.Now()
 	stop := s.handshakeDeadline(ctx)
 	f, err := conn.ReadFrame(s.local.MaxFramePayload)
 	timedOut := !stop()
@@ -422,6 +516,9 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 	if !f.IsControl() || f.Type != TypeHello {
 		if f.IsControl() && f.Type == TypeClose {
 			return nil, nil, s.remoteHandshakeClose(f.Payload)
+		}
+		if h := cfg.FirstFrames[f.Type]; h != nil && f.IsControl() {
+			return nil, nil, s.handOff(ctx, started, h, f)
 		}
 		return nil, nil, s.abortHandshake(protoErr(CodeProtocolError, "first frame must be HELLO"))
 	}
@@ -445,9 +542,22 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 
 	welcome := Welcome{Version: Version, Limits: s.local}
 	for _, e := range h.Extensions {
-		if slices.Contains(cfg.Extensions, e) {
-			welcome.Extensions = append(welcome.Extensions, e)
+		if !slices.Contains(cfg.Extensions, e) || slices.Contains(welcome.Extensions, e) {
+			continue
 		}
+		if cfg.NegotiateExtension != nil {
+			p, err := cfg.NegotiateExtension(ctx, e, h.ExtensionParams[e])
+			if err != nil {
+				continue
+			}
+			if p != nil {
+				if welcome.ExtensionParams == nil {
+					welcome.ExtensionParams = map[string]json.RawMessage{}
+				}
+				welcome.ExtensionParams[e] = p
+			}
+		}
+		welcome.Extensions = append(welcome.Extensions, e)
 	}
 	type acceptedChannel struct {
 		req     ChannelRequest
@@ -476,13 +586,24 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 		welcome.PingTimeout = s.opts.PingTimeout.Seconds()
 	}
 	s.remote = h.Limits
+	s.extensions = welcome.Extensions
+	s.localExtParams = welcome.ExtensionParams
+	s.peerExtParams = paramsFor(h.ExtensionParams, welcome.Extensions)
 	for i, a := range open {
 		c := s.newChannel(a.req, false, chanOpen)
 		c.props = effectiveProperties(a.req)
 		c.sendCredit = int64(s.remote.InitialWindow)
 		open[i].ch = c
 	}
-	if err := conn.WriteFrame(controlFrame(TypeWelcome, welcome)); err != nil {
+	welcomeFrame, err := encodeControl(TypeWelcome, welcome)
+	if err == nil {
+		err = conn.WriteFrame(welcomeFrame)
+	} else {
+		// NegotiateExtension's parameters do not encode, or WELCOME does not
+		// fit in 64 KiB with them: refuse, as a server shutting down would.
+		s.tryClose(CodeGoingAway, "server cannot encode WELCOME")
+	}
+	if err != nil {
 		conn.Close()
 		s.mu.Lock()
 		for _, a := range open {
@@ -516,6 +637,23 @@ func (s *Session) checkHello(h Hello) error {
 		seen[c.ID] = true
 	}
 	return nil
+}
+
+// handOff passes a transport whose first frame is an extension's to that
+// extension's handler (core §3.1).
+func (s *Session) handOff(ctx context.Context, started time.Time, h FirstFrameHandler, f Frame) error {
+	hctx, cancel := context.WithDeadline(ctx, started.Add(s.opts.HandshakeTimeout))
+	defer cancel()
+	err := h(hctx, s.conn, f)
+	if err == nil {
+		return ErrFirstFrameHandled
+	}
+	var r *Refusal
+	if errors.As(err, &r) {
+		return s.abortHandshake(&ProtocolError{Code: r.Code, Message: r.Reason})
+	}
+	s.conn.Close()
+	return err
 }
 
 // handshakeDeadline closes the transport if the handshake outlives the
@@ -597,6 +735,19 @@ func (s *Session) start() {
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
+
+// Extensions returns the extensions negotiated in the handshake: those
+// WELCOME accepted (core §3.6). The caller must not modify the slice.
+func (s *Session) Extensions() []string { return s.extensions }
+
+// ExtensionParams returns the parameters each side sent for the accepted
+// extension name (core §3.8): local is what this side sent in its HELLO or
+// WELCOME, peer what the other side sent. Either is nil if that side sent
+// none. Parameters for extensions that were not accepted are not kept, so
+// both are nil for those. The caller must not modify them.
+func (s *Session) ExtensionParams(name string) (local, peer json.RawMessage) {
+	return s.localExtParams[name], s.peerExtParams[name]
+}
 
 // Done is closed when the session has fully closed.
 func (s *Session) Done() <-chan struct{} { return s.done }

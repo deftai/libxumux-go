@@ -1,8 +1,8 @@
 # libxumux-go
 
-A Go implementation of the [xumux](https://github.com/deftai/xumux) 0.2 core protocol: many channels, each with its own flow control, over one connection.
+A Go implementation of the [xumux](https://github.com/deftai/xumux) 0.3 core protocol (draft `v0.3.0-draft`): many channels, each with its own flow control, over one connection.
 
-It was written from the spec independently of the TypeScript [libxumux](https://github.com/deftai/libxumux), passes the spec's [conformance vectors](https://github.com/deftai/xumux/tree/main/conformance), and is tested against libxumux in both directions. [xumcat](https://github.com/deftai/xumcat), netcat for xumux, is built on it.
+It was written from the spec independently of the TypeScript [libxumux](https://github.com/deftai/libxumux), passes the spec's [conformance vectors](https://github.com/deftai/xumux/tree/main/conformance) and behavioural suite, and is tested against libxumux in both directions. 0.x minor versions refuse each other (CLOSE 4006), so a 0.3 peer and a 0.2 peer, such as libxumux up to v0.4.0, cannot connect; library releases up to v0.3.0 implement protocol 0.2. [xumcat](https://github.com/deftai/xumcat), netcat for xumux, is built on it.
 
 ```sh
 go get github.com/deftai/libxumux-go
@@ -51,6 +51,32 @@ for {
 	...
 }
 ```
+
+## Extensions
+
+xumux 0.3 lets HELLO and WELCOME carry `extensionParams`, parameters for each requested or accepted extension (core §3.8). The library negotiates them; what they mean is up to the extension:
+
+```go
+// Client: request ext/1 with parameters, and validate the server's.
+s, res, err := xumux.Connect(ctx, fc, xumux.ClientConfig{
+	Extensions:      []string{"ext/1"},
+	ExtensionParams: map[string]json.RawMessage{"ext/1": json.RawMessage(`{"level":3}`)},
+	CheckExtensionParams: func(name string, p json.RawMessage) error { ... }, // error: CLOSE 4001
+}, xumux.Options{})
+
+// Server: accept ext/1 and answer its parameters; an error leaves it out of WELCOME.
+s, hello, err := xumux.Accept(ctx, fc, xumux.ServerConfig{
+	Extensions: []string{"ext/1"},
+	NegotiateExtension: func(ctx context.Context, name string, p json.RawMessage) (json.RawMessage, error) { ... },
+}, xumux.Options{})
+
+s.Extensions()                     // accepted extensions
+local, peer := s.ExtensionParams("ext/1")
+```
+
+Parameters for extensions that are not accepted are ignored, and a server never sends any for them. `extensionParams` that is not a JSON object closes the connection with 4001.
+
+An extension can also claim the first frame of a new transport, to continue an existing connection instead of starting one with HELLO (core §3.1). `ServerConfig.FirstFrames` maps a control type in 0x30–0x7F to a `FirstFrameHandler`, which answers in place of WELCOME and takes the transport; `Accept` then returns `ErrFirstFrameHandled`. Without a handler for its type, a first frame other than HELLO closes with 1002.
 
 ## Streams: `net.Conn` over xumux
 
@@ -136,7 +162,7 @@ s, res, err := webrtc.Connect(ctx, t, cfg, opts)   // waits for the DataChannel 
 ## What's implemented
 
 - Framing over byte streams (with the `XMUX` magic) and message transports.
-- The HELLO/WELCOME handshake: version negotiation, limits, auth, channels opened in HELLO.
+- The HELLO/WELCOME handshake: version negotiation, limits, auth, channels opened in HELLO, `extensionParams`, and a server hook for extension-defined first frames.
 - Channels: open, accept or refuse (per channel, or through a `ChannelListener`), reliable/ordered flags, metadata, fragmentation and reassembly, ID reuse after close (§5.4).
 - The `pipe/1` profile as `net.Conn` and `net.Listener` (package `pipe`).
 - Flow control: per-channel credit with receive-window auto-tuning, bounded per connection.
