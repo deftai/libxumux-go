@@ -358,6 +358,48 @@ func TestTransport(t *testing.T) {
 	require.ErrorIs(t, tc.WaitOpen(ctx), nil, "already open")
 }
 
+// Concurrent WriteMessage callers share the bound: none passes the
+// buffer check while another is between its check and its send.
+func TestConcurrentWriters(t *testing.T) {
+	ctx := ctxT(t, 60*time.Second)
+	const high, size, writers, each = 64 << 10, 16 << 10, 8, 200
+	tc, ts := negotiatedPair(t, Config{HighWaterMark: high}, Config{})
+	require.NoError(t, tc.WaitOpen(ctx))
+	require.NoError(t, ts.WaitOpen(ctx))
+
+	got := make(chan int, 1)
+	go func() {
+		n := 0
+		for n < writers*each {
+			if _, err := ts.ReadMessage(); err != nil {
+				break
+			}
+			n++
+		}
+		got <- n
+	}()
+	errc := make(chan error, writers)
+	for range writers {
+		go func() {
+			msg := make([]byte, size)
+			for range each {
+				if err := tc.WriteMessage(msg); err != nil {
+					errc <- err
+					return
+				}
+			}
+			errc <- nil
+		}()
+	}
+	for range writers {
+		require.NoError(t, <-errc)
+	}
+	require.Equal(t, writers*each, <-got)
+	peak := tc.peakBuffered.Load()
+	t.Logf("peak buffered amount %d (limit %d)", peak, high)
+	require.LessOrEqual(t, peak, uint64(high+size))
+}
+
 // WriteMessage blocked on a full send buffer returns once the Transport is
 // closed.
 func TestWriteUnblocksOnClose(t *testing.T) {

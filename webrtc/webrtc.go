@@ -110,6 +110,7 @@ type Transport struct {
 	closed chan struct{} // closed by Close
 	low    chan struct{} // buffered-amount-low signal, capacity 1
 
+	writeMu                      sync.Mutex // serializes WriteMessage: check, then send
 	openOnce, endOnce, closeOnce sync.Once
 	errMu                        sync.Mutex
 	err                          error // from OnError
@@ -266,8 +267,11 @@ func (t *Transport) endErr(msg string) error {
 // WriteMessage sends b as one binary message. While the DataChannel's send
 // buffer holds more than HighWaterMark bytes it first waits for the buffer to
 // drain, so a slow peer slows the writer rather than filling memory. A
-// message larger than the peer's maximum message size fails.
+// message larger than the peer's maximum message size fails. Concurrent
+// calls are serialized, so the bound holds for them too.
 func (t *Transport) WriteMessage(b []byte) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	for t.dc.BufferedAmount() > t.high {
 		select {
 		case <-t.low:
