@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- `CodeBusy` (4011, BUSY): refuse a connection or channel because a resource shared with other connections is exhausted (core §10, added in the spec by deftai/xumux#6).
+- CI runs the xumux behavioural conformance suite (`conformance` job).
+
+### Changed
+
+- Requires Go 1.26 (was 1.25), for `golang.org/x/net` v0.62.0 (test-only in the core). The `webrtc` module moves to Go 1.26 and the latest `x/net` (v0.62.0) and `x/crypto` (v0.58.0) it inherits through pion, which clears the remaining advisories reported by govulncheck in those modules (none were reachable from this code). The `ws` module is unchanged.
+
 ## [0.2.2] - 2026-11-08
 
 Also the first releases of the nested modules `ws` (`ws/v0.1.0`) and `webrtc` (`webrtc/v0.1.0`), which require core v0.2.1 or later.
