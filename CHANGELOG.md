@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-08
+
 ### Added
 
 - `pipe.Conn.WriteTo`, so `io.Copy` from a pipe writes each DATA payload straight to the destination and returns credit only once the destination has taken it. pipe/1 requires credit to follow writes to the local end; with only `Read`, `io.Copy` returned credit as bytes reached its 32 KiB buffer. It also saves a copy.
@@ -26,6 +28,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - First standalone release. The package was developed inside [xumcat](https://github.com/deftai/xumcat), where it last shipped in xumcat v0.3.1, and moved here with its history. The API is unchanged apart from the import path, now `github.com/deftai/libxumux-go` (package `xumux`).
 - A runnable package example: an echo server and client over TCP.
 
-[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/deftai/libxumux-go/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/deftai/libxumux-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/deftai/libxumux-go/releases/tag/v0.1.0
