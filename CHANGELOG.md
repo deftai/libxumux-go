@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- `pipe.Conn.WriteTo`, so `io.Copy` from a pipe writes each DATA payload straight to the destination and returns credit only once the destination has taken it. pipe/1 requires credit to follow writes to the local end; with only `Read`, `io.Copy` returned credit as bytes reached its 32 KiB buffer. It also saves a copy.
+
 ## [0.2.0] - 2026-11-08
 
 ### Added
