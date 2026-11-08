@@ -16,6 +16,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - `conformance/adapter`: runs this library as the server under test for the xumux behavioural conformance suite (deftai/xumux `conformance/behaviour`), via `make test/conformance XUMUX_DIR=...`.
 - Module `github.com/deftai/libxumux-go/ws` (nested, tagged `ws/vX.Y.Z`): the xumux WebSocket binding on `github.com/coder/websocket`. `ws.Dial` returns an `xumux.FrameConn`; `ws.Accept` and `ws.Handler` serve one. It negotiates the `xumux` subprotocol (Dial fails and Accept closes with 1008 without it), carries one frame per binary message, refuses text messages (xumux CLOSE 1002, then WebSocket close 1002), sizes the read limit from `MaxFramePayload` (channel 0's 64 KiB always fits), and closes the WebSocket with 1000, or 1001 after a xumux CLOSE 1001. A peer's 1000/1001 close reads as `io.EOF`. The core module still has no dependencies. First release: `ws/v0.1.0`, requiring core v0.2.1.
+- Module `github.com/deftai/libxumux-go/webrtc`: the WebRTC binding, the whole connection over one reliable, ordered DataChannel, using pion. `CreateDataChannel` makes the negotiated `xumux` channel; `NewTransport` wraps it as a `MessageTransport`, with send backpressure from `BufferedAmount` and `OnBufferedAmountLow`; `Connect` and `Accept` wait for it to open and keep sent frames within the peer's maximum message size. The core module still depends on the standard library only.
 
 ## [0.2.1] - 2026-11-08
 

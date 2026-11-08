@@ -4,7 +4,7 @@ LIBXUMUX_DIR ?=
 XUMUX_DIR ?=
 FUZZTIME ?= 30s
 
-.PHONY: help go/fmt go/vet test test/race test/coverage test/ws test/interop test/conformance test/fuzz check clean
+.PHONY: help go/fmt go/vet test test/race test/coverage test/ws test/webrtc test/interop test/conformance test/fuzz check clean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z/_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-16s %s\n",$$1,$$2}'
@@ -47,7 +47,10 @@ test/fuzz: ## Fuzz every target (FUZZTIME per target, default 30s)
 	  go test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) . || exit 1; \
 	done
 
-check: go/fmt go/vet test/race test/coverage test/ws ## Pre-commit gate: fmt, vet, race tests, coverage, ws module
+test/webrtc: ## Vet and race-test the webrtc module (pion, in-process PeerConnections)
+	cd webrtc && go vet ./... && go test -race -count=1 ./...
+
+check: go/fmt go/vet test/race test/coverage test/ws test/webrtc ## Pre-commit gate: fmt, vet, race tests, coverage, nested modules
 
 clean: ## Remove coverage output
 	rm -f coverage.out coverage.txt coverage.html conformance-adapter

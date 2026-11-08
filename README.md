@@ -109,6 +109,30 @@ Set `DialOptions.MaxFramePayload` / `AcceptOptions.MaxFramePayload` to the sessi
 
 The module is versioned on its own, with tags of the form `ws/vX.Y.Z` (Go's rule for nested modules), and `ws/go.mod` requires a released core version. A change that needs new core API lands in two steps: release the core, then bump the requirement in `ws/go.mod` and tag `ws/v…`.
 
+## WebRTC
+
+The [`webrtc`](webrtc) module implements the [WebRTC binding](https://github.com/deftai/xumux/blob/main/spec/bindings/webrtc.md): the whole connection over one reliable, ordered DataChannel labelled `xumux`, one frame per binary message. It is a separate module, so only programs that use it depend on [pion](https://github.com/pion/webrtc):
+
+```sh
+go get github.com/deftai/libxumux-go/webrtc
+```
+
+xumux does not do signalling. Create the PeerConnection and exchange SDP and ICE as the application likes, and hand the DataChannel over:
+
+```go
+import "github.com/deftai/libxumux-go/webrtc"
+
+dc, err := webrtc.CreateDataChannel(pc)            // negotiated, id 0: both sides, before the offer
+t, err := webrtc.NewTransport(dc, webrtc.Config{}) // straight away, before it can receive
+// ... signalling ...
+s, res, err := webrtc.Connect(ctx, t, cfg, opts)   // waits for the DataChannel to open; webrtc.Accept on the server
+```
+
+- **Backpressure:** `WriteMessage` waits while the DataChannel's `BufferedAmount` is above `Config.HighWaterMark` (1 MiB), until `OnBufferedAmountLow` reports it drained to half. Received messages pass through a small bounded queue from pion's read loop, so a session that stops reading stops SCTP rather than buffering.
+- **Message size:** frames this side sends stay within the peer's `a=max-message-size`. pion accepts messages of up to 1 GiB by default; `SettingEngine.SetSCTPMaxMessageSize(webrtc.RecommendedMaxMessageSize)` limits that to one default-sized frame.
+- **Closing:** the xumux CLOSE exchange runs first, then the DataChannel closes. The PeerConnection is the application's to close, since it may also carry media tracks. If the DataChannel closes unexpectedly, the session ends as lost.
+- A DataChannel created in-band works too: call `NewTransport` inside `OnDataChannel`. `NewTransport` checks the label, protocol and reliability, and takes over the DataChannel's event handlers.
+
 ## What's implemented
 
 - Framing over byte streams (with the `XMUX` magic) and message transports.
@@ -116,10 +140,11 @@ The module is versioned on its own, with tags of the form `ws/vX.Y.Z` (Go's rule
 - Channels: open, accept or refuse (per channel, or through a `ChannelListener`), reliable/ordered flags, metadata, fragmentation and reassembly, ID reuse after close (§5.4).
 - The `pipe/1` profile as `net.Conn` and `net.Listener` (package `pipe`).
 - Flow control: per-channel credit with receive-window auto-tuning, bounded per connection.
+- The WebRTC binding over one DataChannel (module `webrtc`).
 - Probes and keepalive: PING/PONG per channel and per connection.
 - Close codes and errors as in the spec.
 
-**Not implemented yet:** the `webrtc-multichannel/1` and `session-resume/1` extensions, and the WebRTC and QUIC bindings.
+**Not implemented yet:** the `webrtc-multichannel/1` and `session-resume/1` extensions, and the QUIC binding.
 
 ## Limits
 

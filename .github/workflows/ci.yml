@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache-dependency-path: ws/go.sum
       - run: go mod verify
       - run: go vet ./...
@@ -40,6 +40,20 @@ jobs:
         run: |
           go work init . ..
           go test -race -count=1 ./...
+  webrtc:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webrtc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: webrtc/go.sum
+      - run: go mod verify
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
   interop:
     runs-on: ubuntu-latest
     steps:
