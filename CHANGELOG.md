@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+
+- A `pipe.Conn` that failed (the peer sent RESET, or a message type pipe/1 doesn't define) could close its channel with 1000 and send EOF when the application called `Close` straight after the failed `Read`, as `io.Copy`-style code does. The failure's close started in the background and the `Close` usually won. `Close` now closes with the failure's code (1001 after RESET, 1002 after a protocol error) and sends no EOF, and `Reset` on a failed pipe sends no RESET. Found by the xumux behavioural conformance suite.
+
+### Added
+
+- `conformance/adapter`: runs this library as the server under test for the xumux behavioural conformance suite (deftai/xumux `conformance/behaviour`), via `make test/conformance XUMUX_DIR=...`.
+
 ## [0.2.1] - 2026-11-08
 
 ### Added

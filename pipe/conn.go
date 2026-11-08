@@ -53,12 +53,17 @@ type Conn struct {
 	wmu sync.Mutex // serialises Write and CloseWrite
 	wdl *deadline
 
-	mu      sync.Mutex
-	werr    error // set when the pipe has failed: every Write returns it
-	sentEOF bool
-	gotEOF  bool
-	closed  bool
-	once    sync.Once
+	mu   sync.Mutex
+	werr error // set when the pipe has failed: every Write returns it
+	// failCode is the CLOSE_CHANNEL code a failed pipe closes with (1001
+	// after RESET, 1002 after a protocol error), so that a Close racing
+	// the failure does not close it as 1000.
+	failCode   int
+	failReason string
+	sentEOF    bool
+	gotEOF     bool
+	closed     bool
+	once       sync.Once
 }
 
 // NewConn wraps an open pipe/1 channel, such as one accepted from a
@@ -293,6 +298,7 @@ func (c *Conn) fail(err error, code int, reason string) {
 	c.mu.Lock()
 	if c.werr == nil {
 		c.werr = err
+		c.failCode, c.failReason = code, reason
 	}
 	c.mu.Unlock()
 	c.wdl.expire()
@@ -304,6 +310,12 @@ func (c *Conn) fail(err error, code int, reason string) {
 func (c *Conn) Reset(code int, reason string) error {
 	if !c.shut() { // also ends a pending Write
 		return c.opErr("reset", net.ErrClosed)
+	}
+	if code, reason, failed := c.failure(); failed {
+		// The pipe already failed and its channel is closing: no RESET.
+		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancel()
+		return c.ch.Close(ctx, code, reason)
 	}
 	if len(reason) > maxResetReason {
 		reason = reason[:maxResetReason]
@@ -345,10 +357,20 @@ func (c *Conn) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
+	if code, reason, failed := c.failure(); failed {
+		return c.ch.Close(ctx, code, reason) // no EOF after a RESET or protocol error
+	}
 	c.wmu.Lock() // a pending Write has returned: its deadline expired
 	_ = c.sendEOFLocked(ctx)
 	c.wmu.Unlock()
 	return c.ch.Close(ctx, xumux.CodeNormal, "")
+}
+
+// failure reports the close code of a pipe that has failed.
+func (c *Conn) failure() (code int, reason string, failed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failCode, c.failReason, c.failCode != 0
 }
 
 // LocalAddr and RemoteAddr identify the channel; they are not network

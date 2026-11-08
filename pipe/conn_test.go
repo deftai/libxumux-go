@@ -246,3 +246,48 @@ func TestHTTPOverPipes(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A pipe that failed keeps its close code when the application closes it at
+// once, as io.Copy-style code does: no EOF, and 1001 after a RESET or 1002
+// after a protocol error, never 1000.
+func TestCloseAfterFailureKeepsTheCode(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		typ   byte
+		body  string
+		code  int
+		reset bool // the application answers with Reset rather than Close
+	}{
+		{"reset then Close", pipe.TypeReset, `{"code":1001}`, xumux.CodeGoingAway, false},
+		{"unknown type then Close", 0x09, "?", xumux.CodeProtocolError, false},
+		{"unknown type then Reset", 0x09, "?", xumux.CodeProtocolError, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := pipe.NewListener()
+			defer l.Close()
+			client, _ := sessions(t, l)
+			ch, err := client.OpenChannel(ctx(t), pipe.Spec("raw", ""))
+			require.NoError(t, err)
+			b, err := l.AcceptPipe(ctx(t))
+			require.NoError(t, err)
+			require.NoError(t, ch.Send(ctx(t), tc.typ, []byte(tc.body)))
+			_, err = b.Read(make([]byte, 8))
+			require.Error(t, err)
+			if tc.reset {
+				_ = b.Reset(xumux.CodeGoingAway, "local failure")
+			} else {
+				_ = b.Close()
+			}
+			for {
+				m, err := ch.Receive(ctx(t))
+				if err != nil {
+					break
+				}
+				assert.NotEqual(t, pipe.TypeEOF, m.Type, "no EOF from a failed pipe")
+				assert.NotEqual(t, pipe.TypeReset, m.Type, "no RESET from a pipe that already failed")
+			}
+			<-ch.Done()
+			assert.Equal(t, tc.code, ch.CloseInfo().Code)
+		})
+	}
+}
