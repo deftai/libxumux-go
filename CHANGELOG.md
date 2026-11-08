@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
 ### Added
 
 - Package `pipe`: the `pipe/1` profile as standard Go streams.
@@ -20,5 +22,6 @@ All notable changes to this project are documented here. The format follows [Kee
 - First standalone release. The package was developed inside [xumcat](https://github.com/deftai/xumcat), where it last shipped in xumcat v0.3.1, and moved here with its history. The API is unchanged apart from the import path, now `github.com/deftai/libxumux-go` (package `xumux`).
 - A runnable package example: an echo server and client over TCP.
 
-[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/deftai/libxumux-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/deftai/libxumux-go/releases/tag/v0.1.0
