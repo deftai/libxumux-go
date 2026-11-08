@@ -67,6 +67,11 @@ const (
 	CodeKeepaliveTimeout = 4008
 	CodeFlowControlError = 4009
 	CodeChannelRefused   = 4010
+	// CodeBusy refuses a connection (CLOSE instead of WELCOME) or a channel
+	// because a resource shared with other connections is exhausted:
+	// connections, processes, memory. The peer did nothing wrong and may
+	// retry later, backing off (core §10).
+	CodeBusy = 4011
 )
 
 // Default limits and bounds (core §3.4).
