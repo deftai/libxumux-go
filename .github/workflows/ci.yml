@@ -54,14 +54,8 @@ jobs:
       - run: go mod verify
       - run: go vet ./...
       - run: go test -race -count=1 ./...
-  # libxumux (TypeScript) still implements xumux 0.2, and 0.x minors refuse
-  # each other with 4006 (core §3.5), so interop against it cannot pass until
-  # it implements 0.3. The job still runs, pinned to the last release, so the
-  # refusal stays visible, but it does not fail the workflow.
-  # Re-enable (drop continue-on-error, move the ref) when libxumux implements 0.3.
   interop:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -72,7 +66,7 @@ jobs:
           node-version: '22'
       - name: Build libxumux
         run: |
-          git clone --depth 1 --branch v0.4.0 https://github.com/deftai/libxumux ../libxumux
+          git clone --depth 1 --branch main https://github.com/deftai/libxumux ../libxumux
           cd ../libxumux && npm ci && npm run build
       - run: make test/interop LIBXUMUX_DIR=../libxumux
   # The behavioural conformance suite lives in the spec repository.

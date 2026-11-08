@@ -10,7 +10,7 @@ Implements xumux core 0.3 (spec tag `v0.3.0-draft`). 0.x minors are incompatible
 
 - **Breaking (protocol):** `Version` is `[0, 3, 0]`. A server refuses a 0.2 HELLO with CLOSE 4006, and a client closes a 0.2 WELCOME with 1002 (core §3.5).
 - `testdata/vectors.json` is the 0.3 spec's `conformance/vectors.json`, adding `hello-extension-params`, `extension-params-not-object` and `hello-version-0-2`.
-- CI runs the behavioural conformance suite from the spec at `v0.3.0-draft` (57 scenarios). The interop job is pinned to libxumux v0.4.0 and allowed to fail until libxumux implements 0.3.
+- CI runs the behavioural conformance suite from the spec at `v0.3.0-draft` (57 scenarios).
 - `Connect` fails without sending anything if HELLO would exceed the 65536-byte channel-0 limit or its `ExtensionParams` are not valid JSON; `Accept` refuses with CLOSE 1001 if WELCOME would.
 
 ### Added
