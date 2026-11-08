@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-08
+
+Also the first releases of the nested modules `ws` (`ws/v0.1.0`) and `webrtc` (`webrtc/v0.1.0`), which require core v0.2.1 or later.
+
 ### Changed
 
 - Requires Go 1.25 (was 1.24). The test-only dependency `golang.org/x/net` moves from v0.30.0 to v0.55.0, which clears three advisories (HTML parser DoS, XSS, proxy bypass via IPv6 zone IDs). The library never used the affected packages, but `x/net` v0.55.0 itself needs Go 1.25.
@@ -42,7 +46,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - First standalone release. The package was developed inside [xumcat](https://github.com/deftai/xumcat), where it last shipped in xumcat v0.3.1, and moved here with its history. The API is unchanged apart from the import path, now `github.com/deftai/libxumux-go` (package `xumux`).
 - A runnable package example: an echo server and client over TCP.
 
-[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/deftai/libxumux-go/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/deftai/libxumux-go/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/deftai/libxumux-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/deftai/libxumux-go/releases/tag/v0.1.0
