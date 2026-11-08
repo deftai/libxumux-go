@@ -32,6 +32,7 @@ test/ws: ## Vet and race-test the nested ws module (not reached by ./...)
 test/interop: ## Interop tests against libxumux (LIBXUMUX_DIR=path/to/built/libxumux)
 	@test -n "$(LIBXUMUX_DIR)" || (echo "set LIBXUMUX_DIR to a built libxumux checkout" && exit 1)
 	LIBXUMUX_DIR=$(abspath $(LIBXUMUX_DIR)) go test -count=1 -run Interop -v .
+	cd webrtc && LIBXUMUX_DIR=$(abspath $(LIBXUMUX_DIR)) go test -count=1 -run Interop -v .
 
 test/conformance: ## Behavioural conformance suite (XUMUX_DIR=path/to/deftai/xumux checkout)
 	@test -n "$(XUMUX_DIR)" || (echo "set XUMUX_DIR to a deftai/xumux checkout" && exit 1)
