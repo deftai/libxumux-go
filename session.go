@@ -139,8 +139,9 @@ type outItem struct {
 	done    chan error // buffered; may be nil
 	after   func(err error)
 	isClose bool
-	data    bool  // queued in data (round-robin) rather than urgent
-	cost    int64 // bytes counted against MaxControlQueue
+	data    bool     // queued in data (round-robin) rather than urgent
+	ch      *Channel // the channel instance of a data frame
+	cost    int64    // bytes counted against MaxControlQueue
 }
 
 func (it *outItem) finish(err error) {
@@ -854,19 +855,33 @@ func (s *Session) attachLocked(conn FrameConn, preamble []Frame) error {
 	return nil
 }
 
+// detachedNow reports whether the session is open without a base path.
+func (s *Session) detachedNow() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state == stateOpen && s.path == nil
+}
+
 // requeueLocked puts back, at the front of its queue, a frame whose write
 // failed because the base path was lost, so that the next path sends it.
-func (s *Session) requeueLocked(it *outItem) {
+// It reports false for a data frame whose channel has closed meanwhile:
+// that frame must not be sent after the CLOSE_CHANNEL.
+func (s *Session) requeueLocked(it *outItem) bool {
+	defer s.signalWriter()
 	if it.data {
+		if c := it.ch; c == nil || s.chans[c.id] != c || c.state != chanOpen || c.sentClose || c.recvClose {
+			return false
+		}
 		q := s.data[it.f.Channel]
 		if len(q) == 0 {
 			s.rr = append([]uint16{it.f.Channel}, s.rr...)
 		}
 		s.data[it.f.Channel] = append([]*outItem{it}, q...)
-		return
+		return true
 	}
 	s.urgentBytes += it.cost
 	s.urgent = append([]*outItem{it}, s.urgent...)
+	return true
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -983,8 +998,16 @@ func (s *Session) OpenChannel(ctx context.Context, spec ChannelSpec) (*Channel, 
 // Close closes the session gracefully: it lets in-progress sends finish
 // (up to CloseTimeout), sends CLOSE, and waits for the peer's CLOSE.
 func (s *Session) Close(ctx context.Context, code int, reason string) error {
-	deadline := time.After(s.opts.CloseTimeout)
+	// One deadline for all the waits: closed, so every wait sees it.
+	deadline := make(chan struct{})
+	t := time.AfterFunc(s.opts.CloseTimeout, func() { close(deadline) })
+	defer t.Stop()
 	for _, c := range s.Channels() {
+		if s.detachedNow() {
+			// No transport: sends in progress cannot finish, and closing
+			// ends the session at once.
+			break
+		}
 		select {
 		case c.sendSem <- struct{}{}:
 			<-c.sendSem
@@ -1583,6 +1606,9 @@ func (s *Session) enqueueLocked(f Frame, after func(error), dataChannel bool) (*
 	}
 	it := &outItem{f: f, after: after, data: dataChannel}
 	if dataChannel {
+		it.ch = s.chans[f.Channel]
+	}
+	if dataChannel {
 		it.done = make(chan error, 1)
 		q := s.data[f.Channel]
 		if len(q) == 0 {
@@ -1724,8 +1750,11 @@ func (s *Session) writeLoop(p *basePath) {
 				// the write was in progress). The next path sends the frame:
 				// from the extension's copy, or from the queue.
 				if !retained {
-					s.requeueLocked(it)
+					requeued := s.requeueLocked(it)
 					s.mu.Unlock()
+					if !requeued {
+						it.finish(errChannelClosed(it.f.Channel))
+					}
 					return
 				}
 				s.mu.Unlock()

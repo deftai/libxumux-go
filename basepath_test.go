@@ -312,3 +312,100 @@ type nopRWC struct{}
 func (*nopRWC) Read([]byte) (int, error)    { return 0, net.ErrClosed }
 func (*nopRWC) Write(b []byte) (int, error) { return len(b), nil }
 func (*nopRWC) Close() error                { return nil }
+
+// gateConn holds a write, once armed, until release, then fails it.
+type gateConn struct {
+	FrameConn
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newGateConn(fc FrameConn) *gateConn {
+	return &gateConn{FrameConn: fc, entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *gateConn) WriteFrame(f Frame) error {
+	if g.armed.CompareAndSwap(true, false) {
+		close(g.entered)
+		<-g.release
+		return errCut
+	}
+	return g.FrameConn.WriteFrame(f)
+}
+
+// gatePair is seamPair with the client's transport wrapped in a gateConn.
+func gatePair(t *testing.T) (c, s *Session, cch, sch *Channel, g *gateConn) {
+	t.Helper()
+	a, b := net.Pipe()
+	inbound := make(chan *Channel, 1)
+	got := make(chan *Session, 1)
+	go func() {
+		s, _, err := Accept(context.Background(), NewStreamConn(b), ServerConfig{}, acceptAll(func(ch *Channel) { inbound <- ch }))
+		assert.NoError(t, err)
+		got <- s
+	}()
+	g = newGateConn(NewStreamConn(a))
+	c, res, err := Connect(context.Background(), g, ClientConfig{Channels: []ChannelSpec{{Name: "a", Reliable: true, Ordered: true}}}, testOpts)
+	require.NoError(t, err)
+	s = <-got
+	t.Cleanup(func() {
+		c.Close(context.Background(), CodeNormal, "")
+		s.Close(context.Background(), CodeNormal, "")
+	})
+	setHooks(c, newKeepHooks(true))
+	setHooks(s, newKeepHooks(true))
+	return c, s, res.Channels[0], <-inbound, g
+}
+
+// TestSeamReplacedDuringWrite: the path is replaced while its writer is
+// inside WriteFrame; the frame that then fails goes out on the new path.
+func TestSeamReplacedDuringWrite(t *testing.T) {
+	c, s, cch, sch, g := gatePair(t)
+	g.armed.Store(true)
+	sent := make(chan error, 1)
+	go func() { sent <- cch.Send(context.Background(), 1, []byte("x")) }()
+	<-g.entered
+	a, b := net.Pipe()
+	require.NoError(t, attach(s, NewStreamConn(b)))
+	require.NoError(t, attach(c, NewStreamConn(a)))
+	time.Sleep(20 * time.Millisecond) // let the new writer go idle
+	close(g.release)
+	require.NoError(t, <-sent)
+	assert.Equal(t, "x", receiveString(t, sch))
+}
+
+// TestSeamNoRequeueAfterChannelClose: a frame whose write fails after its
+// channel closed is not sent again.
+func TestSeamNoRequeueAfterChannelClose(t *testing.T) {
+	c, s, cch, sch, g := gatePair(t)
+	g.armed.Store(true)
+	sent := make(chan error, 1)
+	go func() { sent <- cch.Send(context.Background(), 1, []byte("stale")) }()
+	<-g.entered
+	closed := make(chan error, 1)
+	go func() { closed <- sch.Close(context.Background(), CodeNormal, "") }()
+	<-cch.Done() // the client got CLOSE_CHANNEL and replied (queued)
+	close(g.release)
+	assert.ErrorIs(t, <-sent, ErrClosed)
+	waitDetached(t, c)
+	waitDetached(t, s)
+	reattach(t, c, s)
+	require.NoError(t, <-closed)
+	_, err := c.Ping(ctx(t))
+	require.NoError(t, err)
+}
+
+func TestSeamCloseWithBlockedSenders(t *testing.T) {
+	c, _, res, raw, _ := seamPair(t, ChannelSpec{Name: "a", Reliable: true, Ordered: true}, ChannelSpec{Name: "b", Reliable: true, Ordered: true})
+	setHooks(c, newKeepHooks(true))
+	raw.Close()
+	waitDetached(t, c)
+	for _, ch := range res.Channels {
+		go ch.Send(context.Background(), 1, []byte("blocked"))
+	}
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	require.NoError(t, c.Close(context.Background(), CodeNormal, ""))
+	assert.Less(t, time.Since(start), 200*time.Millisecond)
+}
