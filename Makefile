@@ -4,7 +4,7 @@ LIBXUMUX_DIR ?=
 XUMUX_DIR ?=
 FUZZTIME ?= 30s
 
-.PHONY: help go/fmt go/vet test test/race test/coverage test/interop test/conformance test/fuzz check clean
+.PHONY: help go/fmt go/vet test test/race test/coverage test/ws test/interop test/conformance test/fuzz check clean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z/_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  %-16s %s\n",$$1,$$2}'
@@ -26,6 +26,9 @@ test/coverage: ## Coverage report; fails below $(COVER_MIN)%
 	go tool cover -html=coverage.out -o coverage.html
 	@awk -v min=$(COVER_MIN) '/coverage:/ { for (i=1;i<=NF;i++) if ($$i=="coverage:") { p=$$(i+1); sub("%","",p); if (p+0 < min) { print "below " min "%: " $$0; bad=1 } } } END { exit bad }' coverage.txt
 
+test/ws: ## Vet and race-test the nested ws module (not reached by ./...)
+	cd ws && go vet ./... && go test -race -count=1 ./...
+
 test/interop: ## Interop tests against libxumux (LIBXUMUX_DIR=path/to/built/libxumux)
 	@test -n "$(LIBXUMUX_DIR)" || (echo "set LIBXUMUX_DIR to a built libxumux checkout" && exit 1)
 	LIBXUMUX_DIR=$(abspath $(LIBXUMUX_DIR)) go test -count=1 -run Interop -v .
@@ -44,7 +47,7 @@ test/fuzz: ## Fuzz every target (FUZZTIME per target, default 30s)
 	  go test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) . || exit 1; \
 	done
 
-check: go/fmt go/vet test/race test/coverage ## Pre-commit gate: fmt, vet, race tests, coverage
+check: go/fmt go/vet test/race test/coverage test/ws ## Pre-commit gate: fmt, vet, race tests, coverage, ws module
 
 clean: ## Remove coverage output
 	rm -f coverage.out coverage.txt coverage.html conformance-adapter
