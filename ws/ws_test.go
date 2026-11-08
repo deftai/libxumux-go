@@ -349,3 +349,23 @@ func TestHandlerClosesWhenHandleReturns(t *testing.T) {
 	defer c.CloseNow()
 	assert.Equal(t, websocket.StatusNormalClosure, closeStatus(c))
 }
+
+// A text message after our CLOSE 1001 still closes the WebSocket with 1002.
+func TestTextAfterGoingAway(t *testing.T) {
+	got := make(chan websocket.StatusCode, 1)
+	srv := rawServer(t, []string{Subprotocol}, func(c *websocket.Conn) {
+		if _, _, err := c.Read(context.Background()); err != nil {
+			got <- -2
+			return
+		}
+		c.Write(context.Background(), websocket.MessageText, []byte("x"))
+		got <- closeStatus(c)
+	})
+	fc, _, err := Dial(testCtx(t), wsURL(srv), nil)
+	require.NoError(t, err)
+	require.NoError(t, fc.WriteFrame(closeFrame(xumux.CodeGoingAway)))
+	_, err = fc.ReadFrame(xumux.DefaultMaxFramePayload)
+	require.Error(t, err)
+	require.NoError(t, fc.Close())
+	assert.Equal(t, websocket.StatusProtocolError, <-got)
+}

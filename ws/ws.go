@@ -163,7 +163,7 @@ func (t *transport) ReadMessage() ([]byte, error) {
 		return nil, err
 	}
 	if typ != websocket.MessageBinary {
-		t.closeCode.CompareAndSwap(0, int32(websocket.StatusProtocolError))
+		t.closeCode.Store(int32(websocket.StatusProtocolError)) // a protocol error outranks going away
 		return nil, xumux.ErrTextMessage
 	}
 	return b, nil
