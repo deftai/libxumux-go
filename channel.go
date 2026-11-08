@@ -232,6 +232,90 @@ func (c *Channel) Send(ctx context.Context, typ byte, payload []byte) error {
 	}
 }
 
+// SendPrefix sends as much of payload as fits in one unfragmented frame
+// and in the send credit available, waiting until there is at least one
+// byte of credit, and reports how many bytes it sent. It suits byte
+// streams such as pipe/1 DATA, whose messages must not be fragmented:
+// call it in a loop until all of payload has gone. An empty payload sends
+// an empty message. Unlike Send, a ctx that ends never leaves part of a
+// message sent: n bytes went as a whole message, or none.
+//
+// If ctx ends while the frame waits for a slow transport, SendPrefix
+// returns n with an error that matches both ErrQueued and ctx's error: the
+// frame is queued and will still be sent, from a copy, so payload can be
+// reused at once. Later sends and Close on the channel wait for it, so
+// nothing overtakes it.
+func (c *Channel) SendPrefix(ctx context.Context, typ byte, payload []byte) (int, error) {
+	select {
+	case c.sendSem <- struct{}{}:
+	case <-c.done:
+		return 0, errChannelClosed(c.id)
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	s := c.s
+	s.mu.Lock()
+	if c.state != chanOpen || c.sentClose || c.recvClose {
+		s.mu.Unlock()
+		return 0, errChannelClosed(c.id)
+	}
+	reliable := c.props.Reliable
+	n := min(len(payload), s.opts.FragmentSize, int(s.remote.MaxFramePayload))
+	s.mu.Unlock()
+	release := func() { <-c.sendSem }
+	if reliable && n > 0 {
+		got, err := c.takeCredit(ctx, n, true)
+		if err != nil {
+			release()
+			return 0, err
+		}
+		n = got
+	}
+	frame := Frame{Channel: c.id, Type: typ, Payload: append([]byte(nil), payload[:n]...)}
+	s.mu.Lock()
+	var it *outItem
+	var err error
+	if c.sentClose || c.recvClose || c.state != chanOpen {
+		err = errChannelClosed(c.id)
+	} else {
+		it, err = s.enqueueLocked(frame, nil, true)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		release()
+		return 0, err
+	}
+	select {
+	case err := <-it.done:
+		release()
+		if err != nil {
+			return 0, err
+		}
+		return n, nil
+	case <-ctx.Done():
+		// Keep the send slot until the frame is written, so that a later
+		// frame (or CLOSE_CHANNEL) cannot overtake it.
+		go func() { <-it.done; release() }()
+		return n, queuedError{ctx.Err()}
+	}
+}
+
+// ErrQueued is matched by the error SendPrefix returns when ctx ended after
+// its frame was queued: the frame will still be sent.
+var ErrQueued = errors.New("xumux: frame queued; it will still be sent")
+
+// queuedError is ctx's error after a frame was queued. It matches both
+// ErrQueued and the ctx error, and keeps a timeout a net.Error timeout.
+type queuedError struct{ err error }
+
+func (e queuedError) Error() string   { return e.err.Error() + " (frame queued; it will still be sent)" }
+func (e queuedError) Unwrap() []error { return []error{ErrQueued, e.err} }
+func (e queuedError) Timeout() bool {
+	t, ok := e.err.(interface{ Timeout() bool })
+	return ok && t.Timeout()
+}
+func (e queuedError) Temporary() bool { return e.Timeout() }
+
 // takeCredit waits for n bytes of send credit. With partial, it takes
 // whatever is available (at least 1 byte, at most n).
 func (c *Channel) takeCredit(ctx context.Context, n int, partial bool) (int, error) {

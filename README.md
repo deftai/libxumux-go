@@ -14,7 +14,7 @@ The package name is `xumux`:
 import xumux "github.com/deftai/libxumux-go"
 ```
 
-The only dependency is the standard library (testify is used in tests).
+The only dependency is the standard library. Tests also use testify and `golang.org/x/net/nettest`.
 
 ## Use
 
@@ -41,11 +41,50 @@ s, hello, err := xumux.Accept(ctx, xumux.NewStreamConn(conn), xumux.ServerConfig
 
 See the [package example](example_test.go) for a complete echo server and client.
 
+A server can take channels from a [`ChannelListener`](listener.go) instead, in the style of `net.Listener`:
+
+```go
+l := xumux.NewChannelListener()
+s, _, err := xumux.Accept(ctx, fc, xumux.ServerConfig{}, xumux.Options{Acceptor: l.Acceptor()})
+for {
+	ch, err := l.Accept(ctx)
+	...
+}
+```
+
+## Streams: `net.Conn` over xumux
+
+A core channel carries typed messages. For byte streams, the [`pipe`](pipe) package implements the [`pipe/1`](https://github.com/deftai/xumux/blob/main/spec/profiles/pipe.md) profile, where each pipe is a `net.Conn` with `CloseWrite` for half-close. `io.Copy`, `bufio`, `crypto/tls` and `net/http` work over it unchanged:
+
+```go
+import "github.com/deftai/libxumux-go/pipe"
+
+// Client: one pipe per HTTP connection.
+hc := &http.Client{Transport: &http.Transport{
+	DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return pipe.Dial(ctx, session, "http", "")
+	},
+}}
+
+// Server: a net.Listener for the pipes peers open.
+l := pipe.NewListener()
+s, _, err := xumux.Accept(ctx, fc, xumux.ServerConfig{}, xumux.Options{Acceptor: l.Acceptor()})
+http.Serve(l, handler)
+```
+
+- **Flow control is backpressure.** Credit goes back to the peer only as `Read` hands bytes to the caller, so a reader that stops reading stops the writer.
+- **Deadlines** (`SetDeadline`, `SetReadDeadline`, `SetWriteDeadline`) work as on a socket, including on calls already waiting. A timeout is a `net.Error` with `Timeout()` true and matches `os.ErrDeadlineExceeded`.
+- **Ending a pipe:** `CloseWrite` sends EOF and reading goes on. `Close` sends EOF if needed and closes the channel. `Reset` reports a failure to the peer, whose `Read` returns a `*pipe.ResetError`.
+- **Targets:** `pipe.Dial` can name a target for the peer to connect the pipe to. A responder must check targets against an allow-list (`Listener.Check`), or it becomes an open proxy.
+
+`pipe.Conn` passes `nettest.TestConn`, the conformance suite the Go team uses for `net.Conn` implementations.
+
 ## What's implemented
 
 - Framing over byte streams (with the `XMUX` magic) and message transports.
 - The HELLO/WELCOME handshake: version negotiation, limits, auth, channels opened in HELLO.
-- Channels: open, accept or refuse, reliable/ordered flags, metadata, fragmentation and reassembly, half-close, ID reuse after close (§5.4).
+- Channels: open, accept or refuse (per channel, or through a `ChannelListener`), reliable/ordered flags, metadata, fragmentation and reassembly, ID reuse after close (§5.4).
+- The `pipe/1` profile as `net.Conn` and `net.Listener` (package `pipe`).
 - Flow control: per-channel credit with receive-window auto-tuning, bounded per connection.
 - Probes and keepalive: PING/PONG per channel and per connection.
 - Close codes and errors as in the spec.
