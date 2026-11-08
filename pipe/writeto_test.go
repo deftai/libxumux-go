@@ -65,3 +65,59 @@ func TestWriteToHonoursTheReadDeadline(t *testing.T) {
 	require.ErrorAs(t, err, &ne)
 	assert.True(t, ne.Timeout())
 }
+
+// Like Read, WriteTo refuses to hand over even data already waiting once
+// the read deadline has passed.
+func TestWriteToStopsAtAnExpiredDeadlineWithDataWaiting(t *testing.T) {
+	a, b := connPair(t)
+	_, err := a.Write([]byte("0123456789"))
+	require.NoError(t, err)
+	head := make([]byte, 3)
+	_, err = io.ReadFull(b, head) // the rest of that DATA waits in b
+	require.NoError(t, err)
+
+	require.NoError(t, b.SetReadDeadline(time.Now().Add(-time.Second)))
+	var dst bytes.Buffer
+	n, err := b.WriteTo(&dst)
+	assert.Zero(t, n)
+	assert.Empty(t, dst.Bytes())
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	require.NoError(t, b.SetReadDeadline(time.Time{}))
+	require.NoError(t, a.CloseWrite())
+	_, err = b.WriteTo(&dst)
+	require.NoError(t, err)
+	assert.Equal(t, "3456789", dst.String(), "nothing was lost")
+}
+
+type badWriter struct{ n int }
+
+func (w badWriter) Write([]byte) (int, error) { return w.n, nil }
+
+// A Writer that makes no progress, or reports an impossible count, ends
+// the copy with an error instead of spinning or panicking.
+func TestWriteToRejectsBrokenWriters(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		n    int
+		want string
+	}{
+		{"no progress", 0, io.ErrShortWrite.Error()},
+		{"negative count", -1, "invalid write result"},
+		{"count past the buffer", 1 << 20, "invalid write result"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := connPair(t)
+			_, err := a.Write([]byte("data"))
+			require.NoError(t, err)
+			done := make(chan error, 1)
+			go func() { _, err := b.WriteTo(badWriter{tc.n}); done <- err }()
+			select {
+			case err := <-done:
+				assert.ErrorContains(t, err, tc.want)
+			case <-time.After(2 * time.Second):
+				t.Fatal("WriteTo did not return")
+			}
+		})
+	}
+}

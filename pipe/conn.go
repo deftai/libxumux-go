@@ -120,6 +120,14 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 	defer c.rmu.Unlock()
 	var total int64
 	for {
+		// As in Read: closed, or a deadline that has passed, stops the copy
+		// even when data is already waiting.
+		if c.isClosed() {
+			return total, c.opErr("read", net.ErrClosed)
+		}
+		if err := c.rdl.ctx().Err(); err != nil {
+			return total, c.opErr("read", err)
+		}
 		if len(c.rbuf) == 0 {
 			if err := c.fillLocked(); err != nil {
 				if err == io.EOF {
@@ -130,6 +138,15 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 			continue
 		}
 		n, err := w.Write(c.rbuf)
+		if n < 0 || n > len(c.rbuf) { // as io.Copy treats a broken Writer
+			n = 0
+			if err == nil {
+				err = errInvalidWrite
+			}
+		}
+		if err == nil && n < len(c.rbuf) {
+			err = io.ErrShortWrite
+		}
 		total += int64(n)
 		c.rbuf = c.rbuf[n:]
 		c.ch.ReturnCredit(n)
@@ -138,6 +155,9 @@ func (c *Conn) WriteTo(w io.Writer) (int64, error) {
 		}
 	}
 }
+
+// errInvalidWrite: a Writer returned a count outside 0..len(p).
+var errInvalidWrite = errors.New("pipe: invalid write result")
 
 // fillLocked receives the next message, with rmu held. It fills rbuf for
 // DATA (possibly with nothing, for an empty DATA), or returns the error
