@@ -16,8 +16,23 @@ import (
 // ErrWriteClosed is returned by Write after CloseWrite.
 var ErrWriteClosed = errors.New("pipe: write after CloseWrite")
 
-// closeTimeout bounds how long Close waits to send EOF and close the channel.
+// closeTimeout bounds how long Close waits to send EOF and close the
+// channel, and how long a channel the Conn closes by itself may take.
 const closeTimeout = 10 * time.Second
+
+// maxResetReason caps the reason a RESET carries, so it always fits in a
+// message.
+const maxResetReason = 1024
+
+// closeChannel closes the channel in the background, bounded by
+// closeTimeout, when pipe/1 says the pipe is over.
+func (c *Conn) closeChannel(code int, reason string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancel()
+		_ = c.ch.Close(ctx, code, reason)
+	}()
+}
 
 // Conn is a pipe/1 channel as a net.Conn. It also has CloseWrite, for
 // half-close, like *net.TCPConn.
@@ -112,16 +127,16 @@ func (c *Conn) Read(b []byte) (int, error) {
 			done := c.sentEOF
 			c.mu.Unlock()
 			if done {
-				go c.ch.Close(context.Background(), xumux.CodeNormal, "")
+				c.closeChannel(xumux.CodeNormal, "")
 			}
 		case TypeReset:
 			var r resetMsg
 			_ = json.Unmarshal(m.Payload, &r)
 			c.rerr = &ResetError{Code: r.Code, Reason: r.Reason}
-			go c.ch.Close(context.Background(), xumux.CodeGoingAway, "")
+			c.closeChannel(xumux.CodeGoingAway, "")
 		default:
 			c.rerr = fmt.Errorf("pipe: unknown pipe/1 message type %#x", m.Type)
-			go c.ch.Close(context.Background(), xumux.CodeProtocolError, fmt.Sprintf("unknown pipe/1 message type %#x", m.Type))
+			c.closeChannel(xumux.CodeProtocolError, fmt.Sprintf("unknown pipe/1 message type %#x", m.Type))
 		}
 	}
 	n := copy(b, c.rbuf)
@@ -190,7 +205,7 @@ func (c *Conn) sendEOFLocked(ctx context.Context) error {
 	done := c.gotEOF
 	c.mu.Unlock()
 	if done {
-		go c.ch.Close(context.Background(), xumux.CodeNormal, "")
+		c.closeChannel(xumux.CodeNormal, "")
 	}
 	return nil
 }
@@ -201,11 +216,16 @@ func (c *Conn) Reset(code int, reason string) error {
 	if !c.shut() { // also ends a pending Write
 		return c.opErr("reset", net.ErrClosed)
 	}
+	if len(reason) > maxResetReason {
+		reason = reason[:maxResetReason]
+	}
 	msg, _ := json.Marshal(resetMsg{Code: code, Reason: reason})
 	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
 	defer cancel()
 	c.wmu.Lock()
-	_, err := c.ch.SendPrefix(ctx, TypeReset, msg)
+	// RESET is one JSON message, so it goes whole (fragmented if need be,
+	// which the profile allows for everything but DATA).
+	err := c.ch.Send(ctx, TypeReset, msg)
 	c.wmu.Unlock()
 	if cerr := c.ch.Close(ctx, xumux.CodeGoingAway, reason); err == nil {
 		err = cerr

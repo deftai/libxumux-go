@@ -238,11 +238,15 @@ func (c *Channel) Send(ctx context.Context, typ byte, payload []byte) error {
 // streams such as pipe/1 DATA, whose messages must not be fragmented:
 // call it in a loop until all of payload has gone. An empty payload sends
 // an empty message. Unlike Send, a ctx that ends never leaves part of a
-// message sent: n bytes were sent as a whole message, or none.
+// message sent: n bytes went as a whole message, or none.
+//
+// If ctx ends while the frame waits for a slow transport, SendPrefix
+// returns n with ctx's error: the frame is queued and will still be sent,
+// from a copy, so payload can be reused at once. Later sends and Close on
+// the channel wait for it, so nothing overtakes it.
 func (c *Channel) SendPrefix(ctx context.Context, typ byte, payload []byte) (int, error) {
 	select {
 	case c.sendSem <- struct{}{}:
-		defer func() { <-c.sendSem }()
 	case <-c.done:
 		return 0, errChannelClosed(c.id)
 	case <-ctx.Done():
@@ -257,29 +261,42 @@ func (c *Channel) SendPrefix(ctx context.Context, typ byte, payload []byte) (int
 	reliable := c.props.Reliable
 	n := min(len(payload), s.opts.FragmentSize, int(s.remote.MaxFramePayload))
 	s.mu.Unlock()
+	release := func() { <-c.sendSem }
 	if reliable && n > 0 {
 		got, err := c.takeCredit(ctx, n, true)
 		if err != nil {
+			release()
 			return 0, err
 		}
 		n = got
 	}
+	frame := Frame{Channel: c.id, Type: typ, Payload: append([]byte(nil), payload[:n]...)}
 	s.mu.Lock()
 	var it *outItem
 	var err error
 	if c.sentClose || c.recvClose || c.state != chanOpen {
 		err = errChannelClosed(c.id)
 	} else {
-		it, err = s.enqueueLocked(Frame{Channel: c.id, Type: typ, Payload: payload[:n]}, nil, true)
+		it, err = s.enqueueLocked(frame, nil, true)
 	}
 	s.mu.Unlock()
 	if err != nil {
+		release()
 		return 0, err
 	}
-	if err := <-it.done; err != nil {
-		return 0, err
+	select {
+	case err := <-it.done:
+		release()
+		if err != nil {
+			return 0, err
+		}
+		return n, nil
+	case <-ctx.Done():
+		// Keep the send slot until the frame is written, so that a later
+		// frame (or CLOSE_CHANNEL) cannot overtake it.
+		go func() { <-it.done; release() }()
+		return n, ctx.Err()
 	}
-	return n, nil
 }
 
 // takeCredit waits for n bytes of send credit. With partial, it takes
