@@ -36,7 +36,7 @@ func spawnLibxumux(t *testing.T, role string) *childConn {
 	if err != nil {
 		t.Skip("node not found")
 	}
-	cmd := exec.Command(node, filepath.Join("..", "interop", "libxumux-peer.mjs"), role)
+	cmd := exec.Command(node, filepath.Join("interop", "libxumux-peer.mjs"), role)
 	cmd.Env = append(os.Environ(), "LIBXUMUX_DIR="+dir)
 	cmd.Stderr = testWriter{t}
 	w, err := cmd.StdinPipe()
