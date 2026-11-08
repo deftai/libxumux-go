@@ -102,6 +102,16 @@ func TestServerSendsNoParamsForUnacceptedExtensions(t *testing.T) {
 	assert.Equal(t, map[string]any{"a/1": map[string]any{"for": "a/1"}}, w["extensionParams"])
 }
 
+func TestClientSendsParamsOnlyForRequested(t *testing.T) {
+	lib, raw := rawPair(t, "stream")
+	go Connect(context.Background(), lib, ClientConfig{
+		Extensions:      []string{"a/1"},
+		ExtensionParams: map[string]json.RawMessage{"a/1": json.RawMessage(`1`), "secret/1": json.RawMessage(`2`)},
+	}, testOpts)
+	h := jsonOf(t, raw.control(TypeHello))
+	assert.Equal(t, map[string]any{"a/1": float64(1)}, h["extensionParams"])
+}
+
 func TestServerWithoutNegotiateSendsNoParams(t *testing.T) {
 	lib, raw := rawPair(t, "stream")
 	go Accept(context.Background(), lib, ServerConfig{Extensions: []string{"a/1"}}, testOpts)
@@ -311,6 +321,11 @@ func TestFirstFrameHandlerDeadline(t *testing.T) {
 		"blocked on the transport": func(_ context.Context, conn FrameConn, _ Frame) error {
 			_, _ = conn.ReadFrame(MaxWindow)
 			return nil
+		},
+		// Returns the transport's error once the deadline closes it.
+		"returns the transport error": func(_ context.Context, conn FrameConn, _ Frame) error {
+			_, err := conn.ReadFrame(MaxWindow)
+			return err
 		},
 	}
 	for name, h := range cases {

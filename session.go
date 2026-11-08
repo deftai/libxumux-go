@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -235,7 +234,8 @@ type ClientConfig struct {
 	Extensions  []string
 	// ExtensionParams are sent in HELLO as extensionParams (core §3.8):
 	// parameters for requested extensions, keyed by extension name. Each
-	// value must be a valid JSON value as its extension defines it.
+	// value must be a valid JSON value as its extension defines it. Keys
+	// for extensions not in Extensions are not sent.
 	ExtensionParams map[string]json.RawMessage
 	// CheckExtensionParams, if set, validates the server's parameters for
 	// each extension WELCOME accepts. params is WELCOME's extensionParams
@@ -266,8 +266,9 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 		interval = 0
 	}
 	hello := Hello{
-		Version: Version, Application: cfg.Application, Extensions: cfg.Extensions, ExtensionParams: cfg.ExtensionParams,
-		Limits: s.local, PingInterval: interval.Seconds(), PingTimeout: s.opts.PingTimeout.Seconds(), Auth: cfg.Auth,
+		Version: Version, Application: cfg.Application, Extensions: cfg.Extensions,
+		ExtensionParams: paramsFor(cfg.ExtensionParams, cfg.Extensions),
+		Limits:          s.local, PingInterval: interval.Seconds(), PingTimeout: s.opts.PingTimeout.Seconds(), Auth: cfg.Auth,
 	}
 	s.requestedExt, s.checkExt = cfg.Extensions, cfg.CheckExtensionParams
 	order := make([]*Channel, len(cfg.Channels))
@@ -299,8 +300,8 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 	}
 
 	s.remote = w.Limits
-	s.extensions = w.Extensions
-	s.localExtParams = paramsFor(cfg.ExtensionParams, w.Extensions)
+	s.extensions = slices.Clone(w.Extensions)
+	s.localExtParams = paramsFor(hello.ExtensionParams, w.Extensions)
 	s.peerExtParams = paramsFor(w.ExtensionParams, w.Extensions)
 	s.pingInterval = time.Duration(w.PingInterval * float64(time.Second))
 	s.pingTimeout = time.Duration(w.PingTimeout * float64(time.Second))
@@ -473,16 +474,16 @@ const (
 	MaxExtensionControlType byte = 0x7F
 )
 
-// paramsFor returns the entries of params for the extensions in accepted,
-// or nil if there are none.
-func paramsFor(params map[string]json.RawMessage, accepted []string) map[string]json.RawMessage {
+// paramsFor returns copies of the entries of params for the extensions in
+// names, or nil if there are none.
+func paramsFor(params map[string]json.RawMessage, names []string) map[string]json.RawMessage {
 	var out map[string]json.RawMessage
-	for _, e := range accepted {
+	for _, e := range names {
 		if p, ok := params[e]; ok {
 			if out == nil {
 				out = map[string]json.RawMessage{}
 			}
-			out[e] = p
+			out[e] = slices.Clone(p)
 		}
 	}
 	return out
@@ -589,7 +590,7 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 	}
 	s.remote = h.Limits
 	s.extensions = welcome.Extensions
-	s.localExtParams = welcome.ExtensionParams
+	s.localExtParams = paramsFor(welcome.ExtensionParams, welcome.Extensions)
 	s.peerExtParams = paramsFor(h.ExtensionParams, welcome.Extensions)
 	for i, a := range open {
 		c := s.newChannel(a.req, false, chanOpen)
@@ -652,10 +653,12 @@ func (s *Session) handOff(ctx context.Context, started time.Time, h FirstFrameHa
 	stop := context.AfterFunc(hctx, func() { s.conn.Close() })
 	err := h(hctx, s.conn, f)
 	if !stop() {
-		if err == nil || errors.Is(err, net.ErrClosed) {
-			err = fmt.Errorf("xumux: first-frame answer: %w", context.Cause(hctx))
+		// The deadline closed the transport; whatever the handler saw, the
+		// cause is the deadline.
+		if err == nil {
+			return fmt.Errorf("xumux: first-frame answer: %w", context.Cause(hctx))
 		}
-		return err
+		return fmt.Errorf("xumux: first-frame answer: %w: %w", context.Cause(hctx), err)
 	}
 	if err == nil {
 		return ErrFirstFrameHandled
@@ -749,16 +752,16 @@ func (s *Session) start() {
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 // Extensions returns the extensions negotiated in the handshake: those
-// WELCOME accepted (core §3.6). The caller must not modify the slice.
-func (s *Session) Extensions() []string { return s.extensions }
+// WELCOME accepted (core §3.6).
+func (s *Session) Extensions() []string { return slices.Clone(s.extensions) }
 
 // ExtensionParams returns the parameters each side sent for the accepted
 // extension name (core §3.8): local is what this side sent in its HELLO or
 // WELCOME, peer what the other side sent. Either is nil if that side sent
 // none. Parameters for extensions that were not accepted are not kept, so
-// both are nil for those. The caller must not modify them.
+// both are nil for those.
 func (s *Session) ExtensionParams(name string) (local, peer json.RawMessage) {
-	return s.localExtParams[name], s.peerExtParams[name]
+	return slices.Clone(s.localExtParams[name]), slices.Clone(s.peerExtParams[name])
 }
 
 // Done is closed when the session has fully closed.
