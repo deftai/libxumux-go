@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- The `session-resume/1` extension (spec `v0.3.0-draft`, `spec/extensions/session-resume.md`). A client that loses its transport resumes the same `Session` on a new one, and no frame is lost or duplicated on reliable, ordered channels.
+  - Client: `ClientConfig.Resume *ResumeClient` requests the extension. `ResumeClient` has `Redial func(ctx) (FrameConn, error)` (required), `Auth`, `RetryDelay`/`MaxRetryDelay`, `FrameLimit`, `MaxControlRetention`, and the callbacks `OnDetach(err)`, `OnResume()` and `OnFallback(*Session, *ConnectResult, error)`. After the server refuses with 41xx, 1002 or 4006, or when RESUME would exceed 64 KiB, the old session ends with that code and, with `OnFallback`, the library connects again with HELLO.
+  - Server: `NewResumeServer(ResumeServerOptions{Timeout, MaxDetached, RotateEvery, FrameLimit, MaxControlRetention}) *ResumeServer`, shared across Accepts via `ServerConfig.Resume`, and `ResumeServer.Detached() int`. RESUME is handled as an extension first frame through the existing `FirstFrames` hook, unchanged: its handler attaches the transport to the session and returns nil, so `Accept` returns `ErrFirstFrameHandled`. `ServerConfig.AuthorizeResume func(ctx, *ResumeRequest, *Session) error` re-authenticates RESUME. If `Authorize` is set without it, RESUME is refused with 4000.
+  - `Session.Detached() bool`. Constants `ExtensionSessionResume`, `TypeResumeToken`/`TypeResume`/`TypeResumed`/`TypeReceipt` (0x30–0x33), `CodeResumeNotFound`/`Expired`/`DataLost`/`StateMismatch` (4100–4103), and the defaults `DefaultResumeTimeout`, `DefaultResumeFrameLimit`, `MinResumeFrameLimit`, `DefaultMaxControlRetention`, `DefaultMaxDetached`.
+  - Behaviour: frame counting and retention per channel instance. RECEIPTs go out promptly and always before a WINDOW_UPDATE that returns credit for the frames. Senders stop at the per-channel frame limit (default 4096) and close with 4004 past 1 MiB of unacknowledged channel-0 data. Replay follows §7 in original order, across ID reuse. A keepalive timeout detaches the session instead of closing it with 4008. On a takeover the old transport is closed without CLOSE. Tokens are single use, confirmed by the client's first RECEIPT, and rotated on request. A late RESUME is answered with 4101.
+
 ### Changed
 
 - Internal: a `Session` is no longer tied to one `FrameConn`. Each base path (core §1.2) has its own read and write loops, and an unexported seam lets an extension detach the session when its transport is lost, instead of closing it, and attach a new transport under the live session (the core §11.1 hook that session-resume/1 uses). Without such an extension nothing changes: losing the transport ends the session as before.

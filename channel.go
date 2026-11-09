@@ -65,6 +65,15 @@ type Channel struct {
 	recvWindow int64     // current window: credit the peer may hold
 	tuneStart  time.Time // start of the current measurement
 	tuneBytes  int64     // bytes returned since tuneStart
+	// session-resume/1 (§4, §5): replayed frames sent and received on this
+	// instance, how many of each the peer has acknowledged or we have
+	// reported, and copies of the sent ones not yet acknowledged.
+	txCount, txAcked, rxCount, rxReported uint32
+	retained                              []retainedFrame
+	// closeSentAt is the channel-0 count of our CLOSE_CHANNEL for this
+	// instance, once closeCounted.
+	closeSentAt  uint32
+	closeCounted bool
 }
 
 func (spec ChannelSpec) request(id uint16) ChannelRequest {

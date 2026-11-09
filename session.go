@@ -142,6 +142,10 @@ type outItem struct {
 	data    bool     // queued in data (round-robin) rather than urgent
 	ch      *Channel // the channel instance of a data frame
 	cost    int64    // bytes counted against MaxControlQueue
+	// session-resume/1 bookkeeping: the channel instance this CLOSE_CHANNEL
+	// closes, and the token this RESUME_TOKEN carries.
+	closeOf *Channel
+	tokenOf *issuedToken
 }
 
 func (it *outItem) finish(err error) {
@@ -201,8 +205,10 @@ type pathHooks interface {
 type Session struct {
 	// path is the attached base path, or nil while detached. It is set before
 	// the handshake and changes only under mu.
-	path   *basePath
-	hooks  pathHooks // nil: transport loss ends the session
+	path  *basePath
+	hooks pathHooks // nil: transport loss ends the session
+	// resume is session-resume/1's state, when it was negotiated (also hooks).
+	resume *resumeState
 	opts   Options
 	client bool
 	local  Limits
@@ -289,6 +295,10 @@ type ClientConfig struct {
 	Auth                 map[string]any
 	// Channels to open during the handshake.
 	Channels []ChannelSpec
+	// Resume, if set, requests session-resume/1 and, if the server accepts
+	// it, keeps the session alive when the transport is lost: the session
+	// detaches and resumes on a new transport from Resume.Redial.
+	Resume *ResumeClient
 }
 
 // ConnectResult is the outcome of the handshake for a client.
@@ -314,7 +324,16 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 		ExtensionParams: paramsFor(cfg.ExtensionParams, cfg.Extensions),
 		Limits:          s.local, PingInterval: interval.Seconds(), PingTimeout: s.opts.PingTimeout.Seconds(), Auth: cfg.Auth,
 	}
-	s.requestedExt, s.checkExt = cfg.Extensions, cfg.CheckExtensionParams
+	if cfg.Resume != nil {
+		if cfg.Resume.Redial == nil {
+			conn.Close()
+			return nil, nil, errors.New("xumux: ClientConfig.Resume needs Redial")
+		}
+		if !slices.Contains(cfg.Extensions, ExtensionSessionResume) {
+			hello.Extensions = append(slices.Clone(cfg.Extensions), ExtensionSessionResume)
+		}
+	}
+	s.requestedExt, s.checkExt = hello.Extensions, cfg.CheckExtensionParams
 	order := make([]*Channel, len(cfg.Channels))
 	for i, spec := range cfg.Channels {
 		r := spec.request(uint16(2*i + 1))
@@ -349,8 +368,16 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 	s.peerExtParams = paramsFor(w.ExtensionParams, w.Extensions)
 	s.pingInterval = time.Duration(w.PingInterval * float64(time.Second))
 	s.pingTimeout = time.Duration(w.PingTimeout * float64(time.Second))
-	s.start()
+	if cfg.Resume != nil && slices.Contains(w.Extensions, ExtensionSessionResume) {
+		s.mu.Lock()
+		s.resume = newClientResume(s, cfg, opts)
+		s.hooks = s.resume
+		s.mu.Unlock()
+	}
 
+	// Apply WELCOME's answers before the reader starts, so that every frame
+	// on a HELLO channel is handled (and, with session-resume/1, counted)
+	// with the channel's effective properties.
 	s.mu.Lock()
 	res := &ConnectResult{Welcome: w, Rejected: w.Rejected}
 	accepted := map[uint16]ChannelAccept{}
@@ -376,6 +403,7 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 		s.handleErrLocked(replayErr)
 	}
 	s.mu.Unlock()
+	s.start()
 	return s, res, nil
 }
 
@@ -491,6 +519,19 @@ type ServerConfig struct {
 	// RESUME, for example). With no handler for a first frame's type, a
 	// first frame other than HELLO closes the transport with 1002.
 	FirstFrames map[byte]FirstFrameHandler
+	// Resume, if set, enables session-resume/1: WELCOME accepts it when the
+	// client asks, and a RESUME on a new transport continues the detached
+	// (or still attached) session it names. Share one ResumeServer across
+	// every Accept. It takes the RESUME first frame (0x31) over FirstFrames.
+	Resume *ResumeServer
+	// AuthorizeResume authenticates a RESUME (session-resume §8): req is its
+	// version and auth, s the session it would continue. If the server
+	// authenticated the original HELLO (with Authorize, or by the transport),
+	// it must check here that the identity is the same, by the same means.
+	// A *Refusal chooses the code; any other error refuses with 4000. If it
+	// is nil and Authorize is set, every RESUME is refused with 4000, so a
+	// token alone never continues an authenticated session.
+	AuthorizeResume func(ctx context.Context, req *ResumeRequest, s *Session) error
 }
 
 // FirstFrameHandler takes over a transport whose first frame f is an
@@ -564,7 +605,11 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 		if f.IsControl() && f.Type == TypeClose {
 			return nil, nil, s.remoteHandshakeClose(f.Payload)
 		}
-		if h := cfg.FirstFrames[f.Type]; h != nil && f.IsControl() {
+		h := cfg.FirstFrames[f.Type]
+		if cfg.Resume != nil && f.Type == TypeResume {
+			h = cfg.Resume.handler(cfg)
+		}
+		if h != nil && f.IsControl() {
 			return nil, nil, s.handOff(ctx, started, h, f)
 		}
 		return nil, nil, s.abortHandshake(protoErr(CodeProtocolError, "first frame must be HELLO"))
@@ -589,10 +634,12 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 
 	welcome := Welcome{Version: Version, Limits: s.local}
 	for _, e := range h.Extensions {
-		if !slices.Contains(cfg.Extensions, e) || slices.Contains(welcome.Extensions, e) {
+		builtin := e == ExtensionSessionResume && cfg.Resume != nil
+		if (!builtin && !slices.Contains(cfg.Extensions, e)) || slices.Contains(welcome.Extensions, e) {
 			continue
 		}
-		if cfg.NegotiateExtension != nil {
+		// session-resume/1 defines no extensionParams (§1): its key is ignored.
+		if cfg.NegotiateExtension != nil && !builtin {
 			p, err := cfg.NegotiateExtension(ctx, e, h.ExtensionParams[e])
 			if err != nil {
 				continue
@@ -658,6 +705,14 @@ func Accept(ctx context.Context, conn FrameConn, cfg ServerConfig, opts Options)
 		}
 		s.mu.Unlock()
 		return nil, nil, err
+	}
+	if cfg.Resume != nil && slices.Contains(welcome.Extensions, ExtensionSessionResume) {
+		// The server's first frame after WELCOME is RESUME_TOKEN (§2).
+		s.mu.Lock()
+		s.resume = newServerResume(s, cfg.Resume)
+		s.hooks = s.resume
+		s.resume.sendTokenLocked()
+		s.mu.Unlock()
 	}
 	s.start()
 	// Run every accepted handler, even if the peer has already gone and the
@@ -899,6 +954,10 @@ func (s *Session) ExtensionParams(name string) (local, peer json.RawMessage) {
 	return slices.Clone(s.localExtParams[name]), slices.Clone(s.peerExtParams[name])
 }
 
+// Detached reports whether the session is open but has no transport: with
+// session-resume/1, between losing the transport and resuming on a new one.
+func (s *Session) Detached() bool { return s.detachedNow() }
+
 // Done is closed when the session has fully closed.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
@@ -1130,6 +1189,11 @@ func (s *Session) handleFrameLocked(f Frame) error {
 		return nil
 	}
 	s.keepaliveAt = time.Time{}
+	if s.resume != nil {
+		if handled, err := s.resume.receivedLocked(f); handled || err != nil {
+			return err
+		}
+	}
 	switch {
 	case f.IsProbe():
 		return s.handleProbeLocked(f)
@@ -1306,6 +1370,11 @@ func (s *Session) ackLocked(c *Channel, a ChannelAccept) error {
 		if f.IsProbe() {
 			err = s.handleProbeLocked(f)
 		} else {
+			if s.resume != nil {
+				// Held frames bypassed the count on arrival (session-resume
+				// §4): count them once, now that the properties are known.
+				s.resume.countHeldLocked(c)
+			}
 			err = s.handleDataLocked(f)
 		}
 		if err != nil {
@@ -1482,10 +1551,12 @@ func (s *Session) sendCloseChannelLocked(c *Channel, code int, reason string) {
 	}
 	// The close completes when the peer's CLOSE_CHANNEL arrives
 	// (onCloseChannelLocked), not when ours is written.
-	_, err := s.enqueueLocked(controlFrame(TypeCloseChannel, m), nil, false)
+	it, err := s.enqueueLocked(controlFrame(TypeCloseChannel, m), nil, false)
 	if err != nil {
 		s.finishChannelLocked(c)
+		return
 	}
+	it.closeOf = c
 }
 
 func (s *Session) finishChannelLocked(c *Channel) {
@@ -1495,6 +1566,9 @@ func (s *Session) finishChannelLocked(c *Channel) {
 	s.windowTotal -= c.recvWindow
 	wasOpening := c.state == chanOpening
 	c.state = chanClosed
+	// The peer's CLOSE_CHANNEL (or the end of the channel some other way)
+	// means retained frames will never be needed (session-resume §5).
+	c.retained = nil
 	if s.chans[c.id] == c {
 		delete(s.chans, c.id)
 	}
@@ -1589,6 +1663,9 @@ func (s *Session) finishLocked(info CloseError) {
 		}
 		s.finishChannelLocked(c)
 	}
+	if s.resume != nil {
+		s.resume.endedLocked()
+	}
 	close(s.done)
 	s.signalWriter()
 	if p := s.path; p != nil {
@@ -1667,6 +1744,14 @@ func (s *Session) nextLocked() *outItem {
 		s.urgentBytes -= it.cost
 		return it
 	}
+	// session-resume/1: a RECEIPT covering every received frame goes before
+	// any WINDOW_UPDATE that returns credit for them (receipt before credit,
+	// §5), and promptly otherwise.
+	if r := s.resume; r != nil && r.dirty && s.state == stateOpen {
+		if f := r.receiptLocked(false); f != nil {
+			return &outItem{f: *f}
+		}
+	}
 	if s.windowDirty && s.state == stateOpen {
 		s.windowDirty = false
 		var entries []windowEntry
@@ -1682,20 +1767,25 @@ func (s *Session) nextLocked() *outItem {
 			return &outItem{f: windowUpdateFrame(entries)}
 		}
 	}
-	if len(s.rr) == 0 {
-		return nil
+	for n := len(s.rr); n > 0; n-- {
+		id := s.rr[0]
+		s.rr = s.rr[1:]
+		if s.resume != nil && !s.resume.canSendLocked(id) {
+			// At its unacknowledged-frame limit: wait for a RECEIPT (§5).
+			s.rr = append(s.rr, id)
+			continue
+		}
+		q := s.data[id]
+		it := q[0]
+		if len(q) > 1 {
+			s.data[id] = q[1:]
+			s.rr = append(s.rr, id)
+		} else {
+			delete(s.data, id)
+		}
+		return it
 	}
-	id := s.rr[0]
-	s.rr = s.rr[1:]
-	q := s.data[id]
-	it := q[0]
-	if len(q) > 1 {
-		s.data[id] = q[1:]
-		s.rr = append(s.rr, id)
-	} else {
-		delete(s.data, id)
-	}
-	return it
+	return nil
 }
 
 // writeLoop writes the frames of base path p until p is detached or the
