@@ -64,12 +64,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      # TEMPORARY: the session-resume/1 interop tests need libxumux's
-      # feat/session-resume branch (deftai/libxumux#23). Switch this back to
-      # --branch main once that PR has merged.
       - name: Build libxumux
         run: |
-          git clone --depth 1 --branch feat/session-resume https://github.com/deftai/libxumux ../libxumux
+          git clone --depth 1 --branch main https://github.com/deftai/libxumux ../libxumux
           cd ../libxumux && npm ci && npm run build
       - run: make test/interop LIBXUMUX_DIR=../libxumux
   # The behavioural conformance suite lives in the spec repository.
