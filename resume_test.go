@@ -767,9 +767,11 @@ func TestResumeFrameLimit(t *testing.T) {
 // RECEIPT covering the frames (§5).
 func TestResumeReceiptBeforeCredit(t *testing.T) {
 	lib, peer := rawPair(t, "stream")
+	tokenSent := make(chan struct{})
 	go func() {
 		peer.awaitHelloSendWelcome(map[string]any{"extensions": []string{ExtensionSessionResume}})
 		peer.send(ctrl(TypeResumeToken, map[string]any{"token": "tok-0123456789abcdef", "resumeTimeout": 30}))
+		close(tokenSent)
 	}()
 	c, res, err := Connect(ctx(t), lib, ClientConfig{
 		Channels: []ChannelSpec{{Name: "a", Reliable: true, Ordered: true}},
@@ -777,6 +779,8 @@ func TestResumeReceiptBeforeCredit(t *testing.T) {
 	}, testOpts)
 	require.NoError(t, err)
 	defer c.Close(context.Background(), CodeNormal, "")
+	// Connect returns at WELCOME; the data frame must not overtake RESUME_TOKEN.
+	<-tokenSent
 	peer.send(Frame{Channel: 1, Type: 1, Payload: []byte("hello")})
 	_, err = res.Channels[0].Receive(ctx(t))
 	require.NoError(t, err)
