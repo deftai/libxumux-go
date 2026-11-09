@@ -290,6 +290,8 @@ func TestResumeClientGivesUpAfterTimeout(t *testing.T) {
 			t.Fatal("session kept past resumeTimeout")
 		}
 		assert.True(t, x.CloseInfo().Lost)
+		// §6: a side that gives up reports 4101, the code the server would send.
+		assert.Equal(t, CodeResumeExpired, x.CloseInfo().Code)
 	}
 }
 

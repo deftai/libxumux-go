@@ -271,7 +271,7 @@ func (r *resumeState) pathLost(err error) bool {
 		defer s.mu.Unlock()
 		if s.state == stateOpen && s.path == nil && r.detachGen == gen {
 			r.expired = true
-			s.finishLocked(CloseError{Code: CodeGoingAway, Reason: "not resumed within resumeTimeout", Lost: true})
+			s.finishLocked(CloseError{Code: CodeResumeExpired, Reason: "not resumed within resumeTimeout", Lost: true})
 		}
 	})
 	if victim := r.srv.addDetached(r); victim != nil {
@@ -729,7 +729,7 @@ func (r *resumeState) clientLoop(lost time.Time) {
 			t.Stop()
 			s.mu.Lock()
 			if s.state == stateOpen && s.path == nil {
-				s.finishLocked(CloseError{Code: CodeGoingAway, Reason: "not resumed within resumeTimeout", Lost: true})
+				s.finishLocked(CloseError{Code: CodeResumeExpired, Reason: "not resumed within resumeTimeout", Lost: true})
 			}
 			s.mu.Unlock()
 			return
