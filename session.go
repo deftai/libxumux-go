@@ -374,8 +374,10 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 		s.hooks = s.resume
 		s.mu.Unlock()
 	}
-	s.start()
 
+	// Apply WELCOME's answers before the reader starts, so that every frame
+	// on a HELLO channel is handled (and, with session-resume/1, counted)
+	// with the channel's effective properties.
 	s.mu.Lock()
 	res := &ConnectResult{Welcome: w, Rejected: w.Rejected}
 	accepted := map[uint16]ChannelAccept{}
@@ -401,6 +403,7 @@ func Connect(ctx context.Context, conn FrameConn, cfg ClientConfig, opts Options
 		s.handleErrLocked(replayErr)
 	}
 	s.mu.Unlock()
+	s.start()
 	return s, res, nil
 }
 

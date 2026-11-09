@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math/rand/v2"
 	"net"
 	"slices"
@@ -925,4 +926,86 @@ func TestResumeClientUnexpectedAnswer(t *testing.T) {
 	(<-peers).fc.Close()
 	assert.Equal(t, CodeProtocolError, <-got)
 	<-c.Done()
+}
+
+// TestResumeCountsFramesRightAfterWelcome: data the server sends on a HELLO
+// channel straight after RESUME_TOKEN is counted under the channel's
+// effective properties, even when the request asked for others.
+func TestResumeCountsFramesRightAfterWelcome(t *testing.T) {
+	lib, peer := rawPair(t, "stream")
+	go func() {
+		peer.control(TypeHello)
+		peer.send(ctrl(TypeWelcome, map[string]any{"version": Version, "extensions": []string{ExtensionSessionResume},
+			"channels": []map[string]any{{"id": 1, "reliable": true, "ordered": true}}}))
+		peer.send(ctrl(TypeResumeToken, map[string]any{"token": "tok-0123456789abcdef", "resumeTimeout": 30}))
+		peer.send(Frame{Channel: 1, Type: 1, Payload: []byte("early")})
+	}()
+	c, res, err := Connect(ctx(t), lib, ClientConfig{
+		Channels: []ChannelSpec{{Name: "a", Reliable: false, Ordered: false}},
+		Resume:   &ResumeClient{Redial: func(context.Context) (FrameConn, error) { return nil, errors.New("no") }},
+	}, testOpts)
+	require.NoError(t, err)
+	defer c.Close(context.Background(), CodeNormal, "")
+	assert.Equal(t, "early", receiveString(t, res.Channels[0]))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.EqualValues(t, 1, c.chans[1].rxCount)
+}
+
+// stuckConn answers RESUME with a scripted frame, then never reads: writes
+// block until it is closed.
+type stuckConn struct {
+	answer Frame
+	reads  int
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *stuckConn) ReadFrame(uint32) (Frame, error) {
+	if c.reads++; c.reads == 1 {
+		return c.answer, nil
+	}
+	<-c.closed
+	return Frame{}, io.EOF
+}
+
+func (c *stuckConn) WriteFrame(f Frame) error {
+	if f.IsControl() && f.Type == TypeResume {
+		return nil
+	}
+	<-c.closed
+	return net.ErrClosed
+}
+
+func (c *stuckConn) CloseWrite() error { return nil }
+func (c *stuckConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+// TestResumeRefusalToStuckServer: refusing a bad RESUMED does not hang on a
+// server that stops reading.
+func TestResumeRefusalToStuckServer(t *testing.T) {
+	lib, peer := rawPair(t, "stream")
+	go func() {
+		peer.awaitHelloSendWelcome(map[string]any{"extensions": []string{ExtensionSessionResume}})
+		peer.send(ctrl(TypeResumeToken, map[string]any{"token": "tok-0123456789abcdef", "resumeTimeout": 30}))
+	}()
+	bad := ctrl(TypeResumed, map[string]any{"token": "t2", "resumeTimeout": 30, "received": [][2]uint32{{0, 99}}})
+	c, _, err := Connect(ctx(t), lib, ClientConfig{Resume: &ResumeClient{Redial: func(context.Context) (FrameConn, error) {
+		return &stuckConn{answer: bad, closed: make(chan struct{})}, nil
+	}}}, testOpts)
+	require.NoError(t, err)
+	waitFor(t, "RESUME_TOKEN", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.resume.token != ""
+	})
+	peer.fc.Close()
+	select {
+	case <-c.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("client hung refusing RESUMED")
+	}
+	assert.Equal(t, CodeResumeStateMismatch, c.CloseInfo().Code)
 }

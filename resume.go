@@ -875,8 +875,11 @@ func (r *resumeState) fail(info CloseError, fallback bool) {
 }
 
 // closeConn refuses on a transport that no session runs on: CLOSE, then a
-// bounded wait for the peer's CLOSE or EOF (core §9.1).
+// wait for the peer's CLOSE or EOF (core §9.1). The timeout bounds it all,
+// including a write to a peer that does not read.
 func closeConn(conn FrameConn, code int, reason string, timeout time.Duration) {
+	t := time.AfterFunc(timeout, func() { conn.Close() })
+	defer t.Stop()
 	_ = conn.WriteFrame(controlFrame(TypeClose, closeMsg{Code: code, Reason: reason}))
 	_ = conn.CloseWrite()
 	done := make(chan struct{})
