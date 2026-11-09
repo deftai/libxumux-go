@@ -4,13 +4,15 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-09
+
 ### Added
 
 - The `session-resume/1` extension (spec `v0.3.0-draft`, `spec/extensions/session-resume.md`). A client that loses its transport resumes the same `Session` on a new one, and no frame is lost or duplicated on reliable, ordered channels.
   - Client: `ClientConfig.Resume *ResumeClient` requests the extension. `ResumeClient` has `Redial func(ctx) (FrameConn, error)` (required), `Auth`, `RetryDelay`/`MaxRetryDelay`, `FrameLimit`, `MaxControlRetention`, and the callbacks `OnDetach(err)`, `OnResume()` and `OnFallback(*Session, *ConnectResult, error)`. After the server refuses with 41xx, 1002 or 4006, or when RESUME would exceed 64 KiB, the old session ends with that code and, with `OnFallback`, the library connects again with HELLO.
   - Server: `NewResumeServer(ResumeServerOptions{Timeout, MaxDetached, RotateEvery, FrameLimit, MaxControlRetention}) *ResumeServer`, shared across Accepts via `ServerConfig.Resume`, and `ResumeServer.Detached() int`. RESUME is handled as an extension first frame through the existing `FirstFrames` hook, unchanged: its handler attaches the transport to the session and returns nil, so `Accept` returns `ErrFirstFrameHandled`. `ServerConfig.AuthorizeResume func(ctx, *ResumeRequest, *Session) error` re-authenticates RESUME. If `Authorize` is set without it, RESUME is refused with 4000.
   - `Session.Detached() bool`. Constants `ExtensionSessionResume`, `TypeResumeToken`/`TypeResume`/`TypeResumed`/`TypeReceipt` (0x30–0x33), `CodeResumeNotFound`/`Expired`/`DataLost`/`StateMismatch` (4100–4103), and the defaults `DefaultResumeTimeout`, `DefaultResumeFrameLimit`, `MinResumeFrameLimit`, `DefaultMaxControlRetention`, `DefaultMaxDetached`.
-  - Behaviour: frame counting and retention per channel instance. RECEIPTs go out promptly and always before a WINDOW_UPDATE that returns credit for the frames. Senders stop at the per-channel frame limit (default 4096) and close with 4004 past 1 MiB of unacknowledged channel-0 data. Replay follows §7 in original order, across ID reuse. A keepalive timeout detaches the session instead of closing it with 4008. On a takeover the old transport is closed without CLOSE. Tokens are single use, confirmed by the client's first RECEIPT, and rotated on request. A late RESUME is answered with 4101.
+  - Behaviour: frame counting and retention per channel instance. RECEIPTs go out promptly and always before a WINDOW_UPDATE that returns credit for the frames. Senders stop at the per-channel frame limit (default 4096) and close with 4004 past 1 MiB of unacknowledged channel-0 data. Replay follows §7 in original order, across ID reuse. A keepalive timeout detaches the session instead of closing it with 4008. On a takeover the old transport is closed without CLOSE. Tokens are single use, confirmed by the client's first RECEIPT, and rotated on request. A late RESUME is answered with 4101. The client retries a refused RESUME only after 1001, 4004, 4007 or 4011 (deftai/xumux#12); a session not resumed within `resumeTimeout` ends with 4101 and `CloseError.Lost`, on both sides.
 
 ### Changed
 
@@ -85,7 +87,8 @@ Also the first releases of the nested modules `ws` (`ws/v0.1.0`) and `webrtc` (`
 - First standalone release. The package was developed inside [xumcat](https://github.com/deftai/xumcat), where it last shipped in xumcat v0.3.1, and moved here with its history. The API is unchanged apart from the import path, now `github.com/deftai/libxumux-go` (package `xumux`).
 - A runnable package example: an echo server and client over TCP.
 
-[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/deftai/libxumux-go/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/deftai/libxumux-go/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/deftai/libxumux-go/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/deftai/libxumux-go/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/deftai/libxumux-go/compare/v0.2.1...v0.2.2
