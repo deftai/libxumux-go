@@ -40,6 +40,7 @@ import (
 type jsPeer struct {
 	t      *testing.T
 	stdin  io.WriteCloser
+	wmu    sync.Mutex // serializes command lines
 	mu     sync.Mutex
 	nextID int
 	reply  map[int]chan map[string]any
@@ -106,7 +107,14 @@ func (p *jsPeer) start(op string, args map[string]any) <-chan map[string]any {
 		m[k] = v
 	}
 	b, _ := json.Marshal(m)
+	p.wmu.Lock()
 	_, err := p.stdin.Write(append(b, '\n'))
+	p.wmu.Unlock()
+	if err != nil {
+		p.mu.Lock()
+		delete(p.reply, id)
+		p.mu.Unlock()
+	}
 	require.NoError(p.t, err)
 	return ch
 }
@@ -421,8 +429,8 @@ func (c sniffConn) WriteFrame(f Frame) error {
 
 func bulkExchange(ctx context.Context, ch *Channel) error { return bulkProgress(ctx, ch, nil) }
 
-// bulkProgress is bulkExchange that adds the bytes it receives to prog.
-func bulkProgress(ctx context.Context, ch *Channel, prog *atomic.Int64) error {
+// bulkProgress is bulkExchange that counts the bytes it receives with gate.
+func bulkProgress(ctx context.Context, ch *Channel, gate *dropGate) error {
 	total, err := strconv.Atoi(strings.TrimPrefix(ch.Name(), "bulk:"))
 	if err != nil {
 		return err
@@ -464,9 +472,7 @@ func bulkProgress(ctx context.Context, ch *Channel, prog *atomic.Int64) error {
 		case 7:
 			rh.Write(m.Payload)
 			received += len(m.Payload)
-			if prog != nil {
-				prog.Add(int64(len(m.Payload)))
-			}
+			gate.add(len(m.Payload))
 		case 8:
 			if err := ch.Send(ctx, 9, []byte(hex.EncodeToString(rh.Sum(nil)))); err != nil {
 				return err
@@ -500,14 +506,14 @@ func bulkProgress(ctx context.Context, ch *Channel, prog *atomic.Int64) error {
 // reporting each result.
 func bulkOpts(results chan<- error) Options { return bulkOptsProgress(results, nil) }
 
-func bulkOptsProgress(results chan<- error, prog *atomic.Int64) Options {
+func bulkOptsProgress(results chan<- error, gate *dropGate) Options {
 	o := testOpts
 	o.Acceptor = func(context.Context, ChannelRequest) (Handler, error) {
 		return func(ch *Channel) {
 			if strings.HasPrefix(ch.Name(), "bulk:") {
 				c, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				results <- bulkProgress(c, ch, prog)
+				results <- bulkProgress(c, ch, gate)
 			}
 		}, nil
 	}
@@ -625,12 +631,12 @@ func TestInteropResumeGoClient(t *testing.T) {
 			{Name: "bulk:8000000", Reliable: true, Ordered: false},
 		}
 		const total = 52_000_000
-		var prog atomic.Int64
+		gate := &dropGate{}
 		require.Len(t, gc.hello, 1)
 		go func() {
 			c, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			results <- bulkProgress(c, gc.hello[0], &prog)
+			results <- bulkProgress(c, gc.hello[0], gate)
 		}()
 		for _, sp := range specs {
 			ch, err := gc.s.OpenChannel(ctx(t), sp)
@@ -639,14 +645,14 @@ func TestInteropResumeGoClient(t *testing.T) {
 			go func() {
 				c, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
-				results <- bulkProgress(c, ch, &prog)
+				results <- bulkProgress(c, ch, gate)
 			}()
 		}
 		const drops = 5
 		for i := 0; i < drops; i++ {
-			waitProgress(t, &prog, int64(i+1)*total/(drops+1))
-			requireMidTransfer(t, &prog, total)
+			gate.stopAt(t, int64(i+1)*total/(drops+1), total)
 			proxy.lose(i)
+			gate.open()
 			waitFor(t, "resumed", func() bool { return gc.resumed.Load() == int32(i+1) })
 			peer.event(5*time.Second, isEvent("resumed"))
 		}
@@ -870,23 +876,68 @@ func newClientWithSession(t *testing.T, peer *jsPeer, proxy *lossyProxy, results
 	return gc
 }
 
-// waitProgress waits until prog reaches n bytes.
-func waitProgress(t *testing.T, prog *atomic.Int64, n int64) {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for prog.Load() < n {
-		require.True(t, time.Now().Before(deadline), "transfer stalled at %d bytes", prog.Load())
-		time.Sleep(50 * time.Microsecond)
+// dropGate counts the bytes the Go side receives on bulk channels. Armed with
+// stopAt, it stops every receiver once the count reaches the mark, until
+// open, so that the transport is dropped while a transfer is certainly under
+// way however fast it runs.
+type dropGate struct {
+	mu      sync.Mutex
+	n, at   int64
+	hit     chan struct{}
+	release chan struct{} // set while receivers are stopped
+}
+
+func (g *dropGate) add(n int) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.n += int64(n)
+	if g.hit != nil && g.n >= g.at {
+		close(g.hit)
+		g.hit, g.release = nil, make(chan struct{})
+	}
+	rel := g.release
+	g.mu.Unlock()
+	if rel != nil {
+		<-rel
 	}
 }
 
-// requireMidTransfer requires that a transfer of total bytes is under way, so
-// that a drop now interrupts it.
-func requireMidTransfer(t *testing.T, prog *atomic.Int64, total int64) {
+// stopAt waits until at bytes of total have been received, and requires
+// that the transfer is not over.
+func (g *dropGate) stopAt(t *testing.T, at, total int64) {
 	t.Helper()
-	n := prog.Load()
-	require.True(t, n > 0 && n < total, "drop at %d of %d bytes received: not mid-transfer", n, total)
+	g.mu.Lock()
+	hit := make(chan struct{})
+	g.at, g.hit = at, hit
+	g.mu.Unlock()
+	select {
+	case <-hit:
+	case <-time.After(30 * time.Second):
+		t.Fatal("transfer stalled")
+	}
+	g.mu.Lock()
+	n := g.n
+	g.mu.Unlock()
+	require.Less(t, n, total, "the transfer is over")
 	t.Logf("drop at %d of %d bytes received", n, total)
+}
+
+// open lets stopped receivers go on.
+func (g *dropGate) open() {
+	g.mu.Lock()
+	if g.release != nil {
+		close(g.release)
+		g.release = nil
+	}
+	g.mu.Unlock()
+}
+
+func (g *dropGate) reset() {
+	g.mu.Lock()
+	g.n = 0
+	g.mu.Unlock()
 }
 
 // requireBulk runs a bulk exchange of n bytes on a new channel of s.
@@ -907,7 +958,7 @@ type goResumeServer struct {
 	log      *tokenLog
 	sessions chan *Session
 	handled  atomic.Int32
-	prog     atomic.Int64 // bytes received on bulk channels the client opened
+	gate     dropGate // bytes received on bulk channels the client opened
 }
 
 func serveGo(t *testing.T, timeout time.Duration, results chan error) *goResumeServer {
@@ -936,7 +987,7 @@ func serveGo(t *testing.T, timeout time.Duration, results chan error) *goResumeS
 				return
 			}
 			go func() {
-				s, _, err := Accept(context.Background(), sniffConn{NewStreamConn(nc), gs.log}, ServerConfig{Resume: gs.rs}, bulkOptsProgress(results, &gs.prog))
+				s, _, err := Accept(context.Background(), sniffConn{NewStreamConn(nc), gs.log}, ServerConfig{Resume: gs.rs}, bulkOptsProgress(results, &gs.gate))
 				switch {
 				case err == nil:
 					mu.Lock()
@@ -987,9 +1038,9 @@ func TestInteropResumeGoServer(t *testing.T) {
 	t.Run("transfer", func(t *testing.T) {
 		peer.clear()
 		proxy := newLossyProxy(t, gs.addr)
-		gs.prog.Store(0)
+		gs.gate.reset()
 		s := connect(t, proxy, gs, map[string]any{"name": "bulk:8000000", "reliable": true, "ordered": true})
-		prog := &gs.prog
+		gate := &gs.gate
 		var pending []<-chan map[string]any
 		// Requested properties do not matter on TCP (§4): all are replayed.
 		for _, x := range []map[string]any{
@@ -1007,13 +1058,13 @@ func TestInteropResumeGoServer(t *testing.T) {
 		go func() {
 			c, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			goDone <- bulkProgress(c, sch, prog)
+			goDone <- bulkProgress(c, sch, gate)
 		}()
 		const drops, total = 5, 52_000_000
 		for i := 0; i < drops; i++ {
-			waitProgress(t, prog, int64(i+1)*total/(drops+1))
-			requireMidTransfer(t, prog, total)
+			gate.stopAt(t, int64(i+1)*total/(drops+1), total)
 			proxy.lose(i)
+			gate.open()
 			waitResumed(t)
 		}
 		for _, p := range pending {
