@@ -1370,6 +1370,11 @@ func (s *Session) ackLocked(c *Channel, a ChannelAccept) error {
 		if f.IsProbe() {
 			err = s.handleProbeLocked(f)
 		} else {
+			if s.resume != nil {
+				// Held frames bypassed the count on arrival (session-resume
+				// §4): count them once, now that the properties are known.
+				s.resume.countHeldLocked(c)
+			}
 			err = s.handleDataLocked(f)
 		}
 		if err != nil {

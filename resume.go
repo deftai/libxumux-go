@@ -358,11 +358,21 @@ func (r *resumeState) receivedLocked(f Frame) (handled bool, err error) {
 		}
 		return false, nil
 	}
-	if c := s.chans[f.Channel]; c != nil && listed(c) {
+	if c := s.chans[f.Channel]; c != nil && listed(c) && c.state == chanOpen {
 		c.rxCount++
 		r.markDirtyLocked()
 	}
 	return false, nil
+}
+
+// countHeldLocked counts a frame held for c before its answer arrived
+// (core §5.2), as it is processed. Such frames are never counted on arrival:
+// they come before WELCOME, or (with paths of their own) overtake the ACK.
+func (r *resumeState) countHeldLocked(c *Channel) {
+	if listed(c) {
+		c.rxCount++
+		r.markDirtyLocked()
+	}
 }
 
 func (r *resumeState) markDirtyLocked() {

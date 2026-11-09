@@ -1009,3 +1009,28 @@ func TestResumeRefusalToStuckServer(t *testing.T) {
 	}
 	assert.Equal(t, CodeResumeStateMismatch, c.CloseInfo().Code)
 }
+
+// TestResumeCountsHeldFrames: a frame held because it overtook WELCOME is
+// counted once, when it is processed.
+func TestResumeCountsHeldFrames(t *testing.T) {
+	lib, peer := rawPair(t, "stream")
+	go func() {
+		peer.control(TypeHello)
+		peer.send(Frame{Channel: 1, Type: 1, Payload: []byte("held")})
+		peer.send(ctrl(TypeWelcome, map[string]any{"version": Version, "extensions": []string{ExtensionSessionResume},
+			"channels": []map[string]any{{"id": 1, "reliable": true, "ordered": true}}}))
+		peer.send(ctrl(TypeResumeToken, map[string]any{"token": "tok-0123456789abcdef", "resumeTimeout": 30}))
+		peer.send(Frame{Channel: 1, Type: 1, Payload: []byte("after")})
+	}()
+	c, res, err := Connect(ctx(t), lib, ClientConfig{
+		Channels: []ChannelSpec{{Name: "a", Reliable: true, Ordered: true}},
+		Resume:   &ResumeClient{Redial: func(context.Context) (FrameConn, error) { return nil, errors.New("no") }},
+	}, testOpts)
+	require.NoError(t, err)
+	defer c.Close(context.Background(), CodeNormal, "")
+	assert.Equal(t, "held", receiveString(t, res.Channels[0]))
+	assert.Equal(t, "after", receiveString(t, res.Channels[0]))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.EqualValues(t, 2, c.chans[1].rxCount)
+}
