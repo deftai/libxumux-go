@@ -186,7 +186,9 @@ type CloseError struct {
 	// Remote is true when the peer initiated the close.
 	Remote bool
 	// Lost is true when the connection ended without a CLOSE exchange: the
-	// transport failed or the peer went away (Code is then 1001).
+	// transport failed or the peer went away (Code is then 1001), or when a
+	// session-resume session was not resumed within resumeTimeout (Code is
+	// then 4101, CodeResumeExpired).
 	Lost bool
 }
 
